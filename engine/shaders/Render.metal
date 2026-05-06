@@ -185,8 +185,12 @@ static inline float3 worldViewRay(float2 uv, constant RenderUniforms& u) {
                    + camUpWorld(u)    * (ndc.y * u.tanHalfFovY));
 }
 
+// Sun direction in world space — shared by skyColor and the fluid lighting
+// so the sun's specular reflection actually hits where you'd expect.
+static inline float3 sunDirWorld() { return normalize(float3(0.45, 0.75, 0.50)); }
+
 // Procedural sky: vertical gradient from horizon→zenith above, horizon→ground
-// below; soft sun glow around a fixed world-space direction.
+// below; soft sun glow around the shared sun direction.
 static inline float3 skyColor(float3 rayDir) {
     constexpr float3 zenith  = float3(0.18, 0.42, 0.78);
     constexpr float3 horizon = float3(0.85, 0.91, 0.97);
@@ -197,11 +201,9 @@ static inline float3 skyColor(float3 rayDir) {
         ? mix(horizon, zenith, pow(h, 0.55))
         : mix(horizon, ground, pow(-h, 0.45));
 
-    // Sun: tight specular core + softer halo.
-    const float3 sunDir = normalize(float3(0.45, 0.75, 0.50));
-    const float  sd     = max(dot(rayDir, sunDir), 0.0);
-    const float  core   = pow(sd, 380.0);
-    const float  halo   = pow(sd, 6.0) * 0.18;
+    const float sd   = max(dot(rayDir, sunDirWorld()), 0.0);
+    const float core = pow(sd, 380.0);
+    const float halo = pow(sd, 6.0) * 0.18;
     col += float3(1.0, 0.96, 0.86) * (core + halo);
 
     return col;
@@ -260,15 +262,28 @@ fragment CompositeOut fluidCompositeFragment(FSOut                    in        
     const     float3 transmitted = refrSky * attenuation;
 
     // ---- Schlick Fresnel (F0=0.02 is water/air at normal incidence) ------
-    // At grazing angles F → 1: pure reflection. Looking straight down: F ≈ 0.02,
-    // mostly transmitted (we see through the surface).
     const float cosI    = max(dot(-rayWorld, N_world), 0.0);
     const float schlick = 0.02 + 0.98 * pow(1.0 - cosI, 5.0);
 
-    // Final: blend transmitted (refracted, absorbed) with reflected sky.
-    // The sun specular comes naturally from the sky reflection — no need
-    // for a separate Blinn-Phong term.
-    const float3 color = mix(transmitted, reflSky, schlick);
+    // ---- Hemispherical sky ambient ---------------------------------------
+    // Sample the sky in the surface-normal direction — surfaces facing up
+    // pick up zenith blue, surfaces facing the horizon pick up brighter
+    // horizon color, etc. Provides natural fill light that varies across
+    // the surface so flat regions don't look uniformly flat. Weighted by
+    // (1 - schlick) so we don't over-brighten the already-mirrored
+    // grazing-angle pixels.
+    const float3 skyFill = skyColor(N_world) * 0.18 * (1.0 - schlick);
+
+    // ---- Explicit sun specular --------------------------------------------
+    // The sun is in skyColor() but it's a wide halo. Add a sharp glisten on
+    // top: when the reflection ray aligns with the sun, we get a tight
+    // bright highlight — the "glint" you see on real water.
+    const float sunAlign = max(dot(reflWorld, sunDirWorld()), 0.0);
+    const float3 sunGlint = float3(1.0, 0.96, 0.84) * pow(sunAlign, 320.0) * 2.5;
+
+    const float3 color = mix(transmitted, reflSky, schlick)
+                       + skyFill
+                       + sunGlint;
 
     const float4 clip = u.proj * float4(viewPos, 1.0);
     CompositeOut o;
@@ -316,4 +331,57 @@ fragment float4 wireBoxFragment() {
     // Cool blue-grey, slightly translucent. Subtle so it reads as a guide,
     // not a solid frame.
     return float4(0.62, 0.72, 0.86, 0.85);
+}
+
+// ---------------------------------------------------------------------------
+// Foam — additive bright sprites for fast surface particles
+// ---------------------------------------------------------------------------
+
+struct FoamOut {
+    float4 position  [[ position ]];
+    float2 uv;
+    float  intensity;
+};
+
+vertex FoamOut foamVertex(constant float4*         positions     [[ buffer(0) ]],
+                          constant RenderUniforms& u             [[ buffer(1) ]],
+                          constant float*          foamIntensity [[ buffer(2) ]],
+                          uint                     vid           [[ vertex_id ]],
+                          uint                     iid           [[ instance_id ]])
+{
+    const float intensity = foamIntensity[iid];
+
+    // Cull below threshold by collapsing the quad off-screen — saves
+    // fragment work for the vast majority of particles which never foam.
+    if (intensity < 0.05) {
+        FoamOut o;
+        o.position  = float4(2, 2, 2, 1);
+        o.uv        = float2(0);
+        o.intensity = 0;
+        return o;
+    }
+
+    const float3 worldCenter = positions[iid].xyz;
+    const float3 viewCenter  = (u.view * float4(worldCenter, 1)).xyz;
+    const float2 corner      = kCorners[vid];
+
+    // Slightly smaller than the SSF particle radius so foam reads as a
+    // bright fleck on top of the surface, not as the surface itself.
+    const float  radius      = u.particleRadius * 0.55;
+    const float3 viewPos     = viewCenter + float3(corner.x * radius,
+                                                   corner.y * radius, 0);
+    FoamOut o;
+    o.position  = u.proj * float4(viewPos, 1);
+    o.uv        = corner;
+    o.intensity = intensity;
+    return o;
+}
+
+fragment float4 foamFragment(FoamOut in [[ stage_in ]])
+{
+    if (in.intensity < 0.05) discard_fragment();
+    const float r2 = dot(in.uv, in.uv);
+    if (r2 > 1.0) discard_fragment();
+    const float falloff = exp(-r2 * 2.5) * in.intensity;
+    return float4(falloff, falloff, falloff, falloff);  // additive white
 }

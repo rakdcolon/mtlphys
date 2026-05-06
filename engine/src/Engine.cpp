@@ -111,9 +111,10 @@ Engine::~Engine() {
     rel(_scanChunkPSO); rel(_scanChunkSumsPSO); rel(_addChunkOffsetsPSO);
     rel(_scatterParticlesPSO); rel(_gatherPositionsPSO); rel(_countNeighborsPSO);
     rel(_predictPSO); rel(_densityLambdaSortedPSO); rel(_applyDeltaSortedPSO);
-    rel(_scatterPositionsPSO); rel(_finalizePSO);
+    rel(_scatterPositionsPSO); rel(_finalizePSO); rel(_computeFoamPSO);
     rel(_fluidDepthPSO); rel(_fluidThicknessPSO); rel(_fluidSmoothPSO); rel(_fluidCompositePSO);
-    rel(_wireBoxPSO);
+    rel(_wireBoxPSO); rel(_foamPSO);
+    rel(_foamIntensity);
     rel(_fluidDepthDSS); rel(_compositeDSS); rel(_wireBoxDSS); rel(_passthroughDSS);
     rel(_depthLinearTex); rel(_depthAttachmentTex); rel(_smoothedDepthTex); rel(_thicknessTex);
     rel(_library); rel(_queue);
@@ -146,6 +147,7 @@ void Engine::buildPipelines() {
     _applyDeltaSortedPSO     = makeComputePSO(_device, _library, "applyDeltaSorted");
     _scatterPositionsPSO     = makeComputePSO(_device, _library, "scatterPositionsToOriginal");
     _finalizePSO             = makeComputePSO(_device, _library, "finalizeStep");
+    _computeFoamPSO          = makeComputePSO(_device, _library, "computeFoam");
 
     // ---- Build the three SSF render pipelines ------------------------------
 
@@ -249,6 +251,36 @@ void Engine::buildPipelines() {
         }
     }
 
+    // Foam pipeline. Same target as composite (drawable + Depth32Float).
+    // Additive blending so multiple overlapping bright sprites accumulate.
+    {
+        auto vName = NS::String::string("foamVertex",   NS::UTF8StringEncoding);
+        auto fName = NS::String::string("foamFragment", NS::UTF8StringEncoding);
+        auto vFn   = _library->newFunction(vName);
+        auto fFn   = _library->newFunction(fName);
+        auto desc  = MTL::RenderPipelineDescriptor::alloc()->init();
+        desc->setVertexFunction(vFn);
+        desc->setFragmentFunction(fFn);
+        auto color = desc->colorAttachments()->object(0);
+        color->setPixelFormat(MTL::PixelFormatBGRA8Unorm_sRGB);
+        color->setBlendingEnabled(true);
+        color->setRgbBlendOperation(MTL::BlendOperationAdd);
+        color->setAlphaBlendOperation(MTL::BlendOperationAdd);
+        color->setSourceRGBBlendFactor(MTL::BlendFactorOne);
+        color->setSourceAlphaBlendFactor(MTL::BlendFactorOne);
+        color->setDestinationRGBBlendFactor(MTL::BlendFactorOne);
+        color->setDestinationAlphaBlendFactor(MTL::BlendFactorOne);
+        desc->setDepthAttachmentPixelFormat(MTL::PixelFormatDepth32Float);
+        NS::Error* e = nullptr;
+        _foamPSO = _device->newRenderPipelineState(desc, &e);
+        desc->release(); vFn->release(); fFn->release();
+        if (!_foamPSO) {
+            std::fprintf(stderr, "mtlphys: failed to build foam PSO: %s\n",
+                         e ? e->localizedDescription()->utf8String() : "unknown");
+            std::abort();
+        }
+    }
+
     // Depth-stencil states.
     {
         auto d = MTL::DepthStencilDescriptor::alloc()->init();
@@ -345,6 +377,7 @@ void Engine::buildSpatialBuffers() {
     rel(_chunkSums); rel(_sortedIndex); rel(_sortedPositions); rel(_sortedPositionsNext);
     rel(_neighborCounts); rel(_spatialParams);
     rel(_lambdas); rel(_sortedLambdas);
+    rel(_foamIntensity);
 
     const size_t particleBytes  = roundUp(_particleCount, kThreadgroupSize) * sizeof(uint32_t);
     const size_t particleFloatBs= roundUp(_particleCount, kThreadgroupSize) * sizeof(float);
@@ -365,6 +398,7 @@ void Engine::buildSpatialBuffers() {
     _spatialParams       = _device->newBuffer(sizeof(SpatialParams), MTL::ResourceStorageModeShared);
     _lambdas             = _device->newBuffer(particleFloatBs,       MTL::ResourceStorageModePrivate);
     _sortedLambdas       = _device->newBuffer(particleFloatBs,       MTL::ResourceStorageModePrivate);
+    _foamIntensity       = _device->newBuffer(particleFloatBs,       MTL::ResourceStorageModePrivate);
 
     auto* sp = static_cast<SpatialParams*>(_spatialParams->contents());
     sp->gridOrigin         = mp::float3{ kBoundsMin.x, kBoundsMin.y, kBoundsMin.z };
@@ -616,6 +650,20 @@ void Engine::step(MTL::CommandBuffer* cmd, float dt) {
         enc->dispatchThreads(MTL::Size(padded, 1, 1),
                              MTL::Size(kThreadgroupSize, 1, 1));
         enc->endEncoding(); }
+
+    // 6. Foam intensity per particle — derived from final velocity and
+    // neighbor count. Cheap and uses already-resident buffers.
+    {   auto* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(_computeFoamPSO);
+        enc->setBuffer(_velocities,     0, 0);
+        enc->setBuffer(_neighborCounts, 0, 1);
+        enc->setBuffer(_foamIntensity,  0, 2);
+        enc->setBytes(&_particleCount,  sizeof(_particleCount), 3);
+        const float maxN = float(kMaxNeighborsForViz);
+        enc->setBytes(&maxN, sizeof(maxN), 4);
+        enc->dispatchThreads(MTL::Size(padded, 1, 1),
+                             MTL::Size(kThreadgroupSize, 1, 1));
+        enc->endEncoding(); }
 }
 
 void Engine::runExclusiveScan(MTL::CommandBuffer* cmd,
@@ -664,18 +712,13 @@ void Engine::render(MTL::CommandBuffer* cmd,
                     uint32_t pixelWidth,
                     uint32_t pixelHeight,
                     float aspectRatio,
-                    float timeSeconds) {
+                    const float eyeXyz[3],
+                    const float targetXyz[3]) {
     ensureRenderTargets(pixelWidth, pixelHeight);
 
-    // ---- Camera ----
-    // Frame the entire 6×9×6 simulation box: aim at box center (y=1.5),
-    // pull back far enough that the 9-unit vertical extent fits the FOV
-    // with margin. Slight downward look from y=4 gives a 3/4 perspective.
     const float fovY = 1.0f;
-    const float r    = 13.0f;
-    const float a    = timeSeconds * 0.3f;
-    const simd::float3 eye{ r * std::cos(a), 4.0f, r * std::sin(a) };
-    const simd::float3 center{ 0, 1.5f, 0 };
+    const simd::float3 eye{ eyeXyz[0], eyeXyz[1], eyeXyz[2] };
+    const simd::float3 center{ targetXyz[0], targetXyz[1], targetXyz[2] };
     const simd::float3 upV{ 0, 1, 0 };
 
     RenderUniforms u{};
@@ -776,6 +819,16 @@ void Engine::render(MTL::CommandBuffer* cmd,
         enc->setVertexBytes(&bMin, sizeof(bMin), 2);
         enc->setVertexBytes(&bMax, sizeof(bMax), 3);
         enc->drawPrimitives(MTL::PrimitiveTypeLine, NS::UInteger(0), NS::UInteger(24));
+
+        // 3c. Foam — additive bright sprites, depth-tested against fluid surface.
+        enc->setRenderPipelineState(_foamPSO);
+        enc->setDepthStencilState(_wireBoxDSS);   // LessEqual, no depth write
+        enc->setVertexBuffer(_positions,     0, 0);
+        enc->setVertexBytes(&u, sizeof(u),       1);
+        enc->setVertexBuffer(_foamIntensity, 0, 2);
+        enc->drawPrimitives(MTL::PrimitiveTypeTriangle,
+                            NS::UInteger(0), NS::UInteger(6),
+                            NS::UInteger(_particleCount));
 
         enc->endEncoding();
     }

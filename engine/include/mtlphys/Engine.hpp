@@ -47,14 +47,15 @@ public:
     void step(MTL::CommandBuffer* cmd, float dt);
 
     // Render the particle field as a fluid surface (screen-space fluid: depth
-    // pass → masked Gaussian blur → composite with normal reconstruction).
-    // Caller passes the MTKView final pass descriptor + drawable size.
+    // pass → smooth → thickness → composite + box). Caller supplies camera
+    // pose; the engine builds view/proj from there.
     void render(MTL::CommandBuffer* cmd,
                 MTL::RenderPassDescriptor* finalPassDesc,
                 uint32_t pixelWidth,
                 uint32_t pixelHeight,
                 float aspectRatio,
-                float timeSeconds);
+                const float eyeXyz[3],
+                const float targetXyz[3]);
 
     uint32_t particleCount() const noexcept { return _particleCount; }
     uint32_t totalCells()    const noexcept { return _totalCells; }
@@ -107,6 +108,7 @@ private:
     MTL::ComputePipelineState* _applyDeltaSortedPSO     = nullptr;
     MTL::ComputePipelineState* _scatterPositionsPSO     = nullptr;
     MTL::ComputePipelineState* _finalizePSO             = nullptr;
+    MTL::ComputePipelineState* _computeFoamPSO          = nullptr;
 
     // Render pipelines for screen-space fluid rendering
     MTL::RenderPipelineState*  _fluidDepthPSO       = nullptr;
@@ -114,6 +116,7 @@ private:
     MTL::RenderPipelineState*  _fluidSmoothPSO      = nullptr;
     MTL::RenderPipelineState*  _fluidCompositePSO   = nullptr;
     MTL::RenderPipelineState*  _wireBoxPSO          = nullptr;
+    MTL::RenderPipelineState*  _foamPSO             = nullptr;
     MTL::DepthStencilState*    _fluidDepthDSS       = nullptr;
     MTL::DepthStencilState*    _compositeDSS        = nullptr;  // depthWrite=true, always
     MTL::DepthStencilState*    _wireBoxDSS          = nullptr;  // depthWrite=false, less
@@ -149,6 +152,7 @@ private:
     // PBF solver scratch
     MTL::Buffer* _lambdas        = nullptr;   // float per particle (orig-index, for read-back)
     MTL::Buffer* _sortedLambdas  = nullptr;   // float per sorted slot
+    MTL::Buffer* _foamIntensity  = nullptr;   // float per particle, [0,1]
 
     uint32_t _particleCount   = 0;
     uint32_t _totalCells      = 0;

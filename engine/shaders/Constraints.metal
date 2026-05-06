@@ -191,7 +191,11 @@ kernel void applyDeltaSorted(device const float4*         sortedPositions     [[
     const float dlen    = length(delta);
     if (dlen > maxStep) delta *= maxStep / dlen;
 
-    sortedPositionsNext[slot] = float4(p_i + delta, 1.0f);
+    // Clamp to bounds inside the solver so particles don't get shoved past
+    // walls (causing artificial pressure buildup that finalize then has to
+    // dissipate via friction → wall sticking).
+    const float3 newPos = clamp(p_i + delta, pp.boundsMin, pp.boundsMax);
+    sortedPositionsNext[slot] = float4(newPos, 1.0f);
 }
 
 // ---------------------------------------------------------------------------
@@ -206,6 +210,28 @@ kernel void scatterPositionsToOriginal(device const float4*    sortedPositions [
 {
     if (slot >= sp.particleCount) return;
     positions[sortedIndex[slot]] = sortedPositions[slot];
+}
+
+// ---------------------------------------------------------------------------
+// Foam intensity per particle (post-finalize, uses final velocities)
+// ---------------------------------------------------------------------------
+// Foam appears where the fluid is BOTH moving fast AND near the surface.
+// Surface-ness comes from the spatial hash (neighborCount low → surface).
+// Speed comes from the just-computed velocity. Output is in [0, 1] and is
+// read by the foam render pass to set sprite brightness.
+
+kernel void computeFoam(device const float4*  velocities    [[ buffer(0) ]],
+                        device const uint*    neighborCounts[[ buffer(1) ]],
+                        device float*         foamIntensity [[ buffer(2) ]],
+                        constant uint&        count         [[ buffer(3) ]],
+                        constant float&       maxNeighbors  [[ buffer(4) ]],
+                        uint                  gid           [[ thread_position_in_grid ]])
+{
+    if (gid >= count) return;
+    const float speed   = length(velocities[gid].xyz);
+    const float surface = 1.0 - clamp(float(neighborCounts[gid]) / maxNeighbors, 0.0, 1.0);
+    const float speedF  = smoothstep(1.2, 4.5, speed);   // foam threshold ~1.2 m/s
+    foamIntensity[gid]  = surface * speedF;
 }
 
 // ---------------------------------------------------------------------------
@@ -227,16 +253,32 @@ kernel void finalizeStep(device float4*           positions       [[ buffer(0) ]
     float3 v = (p - pPrev) * pp.invDt;
     v *= pp.damping;
 
-    const float weps  = 1e-3f;
-    const float kFric = 0.85f;
-    bool atWall = false;
-    if (p.x <= pp.boundsMin.x + weps) { if (v.x < 0.0f) v.x = 0.0f; atWall = true; }
-    if (p.y <= pp.boundsMin.y + weps) { if (v.y < 0.0f) v.y = 0.0f; atWall = true; }
-    if (p.z <= pp.boundsMin.z + weps) { if (v.z < 0.0f) v.z = 0.0f; atWall = true; }
-    if (p.x >= pp.boundsMax.x - weps) { if (v.x > 0.0f) v.x = 0.0f; atWall = true; }
-    if (p.y >= pp.boundsMax.y - weps) { if (v.y > 0.0f) v.y = 0.0f; atWall = true; }
-    if (p.z >= pp.boundsMax.z - weps) { if (v.z > 0.0f) v.z = 0.0f; atWall = true; }
-    if (atWall) v *= kFric;
+    // Wall response: zero the velocity component INTO each wall (absorption),
+    // then apply ANISOTROPIC friction:
+    //   - floor: strong friction kills tangential skating
+    //   - vertical walls: light friction so gravity drags particles down
+    //     instead of trapping them like honey on a window
+    const float weps = 1e-3f;
+    const bool xMin = p.x <= pp.boundsMin.x + weps;
+    const bool xMax = p.x >= pp.boundsMax.x - weps;
+    const bool yMin = p.y <= pp.boundsMin.y + weps;
+    const bool yMax = p.y >= pp.boundsMax.y - weps;
+    const bool zMin = p.z <= pp.boundsMin.z + weps;
+    const bool zMax = p.z >= pp.boundsMax.z - weps;
+
+    if (xMin) v.x = max(v.x, 0.0f);
+    if (xMax) v.x = min(v.x, 0.0f);
+    if (yMin) v.y = max(v.y, 0.0f);
+    if (yMax) v.y = min(v.y, 0.0f);
+    if (zMin) v.z = max(v.z, 0.0f);
+    if (zMax) v.z = min(v.z, 0.0f);
+
+    if (yMin) {
+        v.x *= 0.55f;
+        v.z *= 0.55f;
+    } else if (xMin || xMax || zMin || zMax) {
+        v *= 0.97f;
+    }
 
     const float vMax = 1.0f * pp.h * pp.invDt;
     const float vLen = length(v);

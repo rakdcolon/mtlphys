@@ -17,7 +17,8 @@ NS_ASSUME_NONNULL_BEGIN
                         pixelWidth:(uint32_t)pixelWidth
                        pixelHeight:(uint32_t)pixelHeight
                        aspectRatio:(float)aspect
-                              time:(float)t;
+                                eyeX:(float)eyeX eyeY:(float)eyeY eyeZ:(float)eyeZ
+                          targetX:(float)targetX targetY:(float)targetY targetZ:(float)targetZ;
 - (void)resetWithParticleCount:(uint32_t)count;
 
 @property (readonly) uint32_t particleCount;

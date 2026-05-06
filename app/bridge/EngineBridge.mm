@@ -34,10 +34,13 @@
                       pixelWidth:(uint32_t)pixelWidth
                      pixelHeight:(uint32_t)pixelHeight
                      aspectRatio:(float)aspect
-                            time:(float)t {
+                                eyeX:(float)eyeX eyeY:(float)eyeY eyeZ:(float)eyeZ
+                          targetX:(float)targetX targetY:(float)targetY targetZ:(float)targetZ {
     auto* mtlCmd  = (__bridge MTL::CommandBuffer*)cmd;
     auto* mtlPass = (__bridge MTL::RenderPassDescriptor*)passDesc;
-    _engine->render(mtlCmd, mtlPass, pixelWidth, pixelHeight, aspect, t);
+    const float eye[3]    = { eyeX, eyeY, eyeZ };
+    const float target[3] = { targetX, targetY, targetZ };
+    _engine->render(mtlCmd, mtlPass, pixelWidth, pixelHeight, aspect, eye, target);
 }
 
 - (void)resetWithParticleCount:(uint32_t)count {
