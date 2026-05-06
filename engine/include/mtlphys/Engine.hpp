@@ -110,15 +110,20 @@ private:
 
     // Render pipelines for screen-space fluid rendering
     MTL::RenderPipelineState*  _fluidDepthPSO       = nullptr;
+    MTL::RenderPipelineState*  _fluidThicknessPSO   = nullptr;
     MTL::RenderPipelineState*  _fluidSmoothPSO      = nullptr;
     MTL::RenderPipelineState*  _fluidCompositePSO   = nullptr;
+    MTL::RenderPipelineState*  _wireBoxPSO          = nullptr;
     MTL::DepthStencilState*    _fluidDepthDSS       = nullptr;
+    MTL::DepthStencilState*    _compositeDSS        = nullptr;  // depthWrite=true, always
+    MTL::DepthStencilState*    _wireBoxDSS          = nullptr;  // depthWrite=false, less
     MTL::DepthStencilState*    _passthroughDSS      = nullptr;
 
     // Offscreen textures for SSF passes (allocated lazily on resize)
     MTL::Texture* _depthLinearTex     = nullptr;  // R32Float, view-space depth
     MTL::Texture* _depthAttachmentTex = nullptr;  // Depth32Float, sphere occlusion
     MTL::Texture* _smoothedDepthTex   = nullptr;  // R32Float, smoothed depth
+    MTL::Texture* _thicknessTex       = nullptr;  // R16Float, additive thickness
     uint32_t      _rtWidth  = 0;
     uint32_t      _rtHeight = 0;
 

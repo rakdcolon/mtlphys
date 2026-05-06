@@ -112,9 +112,10 @@ Engine::~Engine() {
     rel(_scatterParticlesPSO); rel(_gatherPositionsPSO); rel(_countNeighborsPSO);
     rel(_predictPSO); rel(_densityLambdaSortedPSO); rel(_applyDeltaSortedPSO);
     rel(_scatterPositionsPSO); rel(_finalizePSO);
-    rel(_fluidDepthPSO); rel(_fluidSmoothPSO); rel(_fluidCompositePSO);
-    rel(_fluidDepthDSS); rel(_passthroughDSS);
-    rel(_depthLinearTex); rel(_depthAttachmentTex); rel(_smoothedDepthTex);
+    rel(_fluidDepthPSO); rel(_fluidThicknessPSO); rel(_fluidSmoothPSO); rel(_fluidCompositePSO);
+    rel(_wireBoxPSO);
+    rel(_fluidDepthDSS); rel(_compositeDSS); rel(_wireBoxDSS); rel(_passthroughDSS);
+    rel(_depthLinearTex); rel(_depthAttachmentTex); rel(_smoothedDepthTex); rel(_thicknessTex);
     rel(_library); rel(_queue);
 }
 
@@ -187,13 +188,87 @@ void Engine::buildPipelines() {
     _fluidCompositePSO = buildRenderPSO("fullscreenVertex",      "fluidCompositeFragment",
                                         MTL::PixelFormatBGRA8Unorm_sRGB, MTL::PixelFormatDepth32Float);
 
-    // Depth-stencil states. Depth pass uses Less + write-enabled; the fullscreen
-    // passes don't read or write depth.
+    // Thickness pipeline. Reuses fluidDepthVertex (same billboard geometry).
+    // No depth attachment; additive blending sums per-particle Gaussians into
+    // the R16Float thickness texture.
+    {
+        auto vName = NS::String::string("fluidDepthVertex",      NS::UTF8StringEncoding);
+        auto fName = NS::String::string("fluidThicknessFragment", NS::UTF8StringEncoding);
+        auto vFn   = _library->newFunction(vName);
+        auto fFn   = _library->newFunction(fName);
+        auto desc  = MTL::RenderPipelineDescriptor::alloc()->init();
+        desc->setVertexFunction(vFn);
+        desc->setFragmentFunction(fFn);
+        auto color = desc->colorAttachments()->object(0);
+        color->setPixelFormat(MTL::PixelFormatR16Float);
+        color->setBlendingEnabled(true);
+        color->setRgbBlendOperation(MTL::BlendOperationAdd);
+        color->setAlphaBlendOperation(MTL::BlendOperationAdd);
+        color->setSourceRGBBlendFactor(MTL::BlendFactorOne);
+        color->setSourceAlphaBlendFactor(MTL::BlendFactorOne);
+        color->setDestinationRGBBlendFactor(MTL::BlendFactorOne);
+        color->setDestinationAlphaBlendFactor(MTL::BlendFactorOne);
+        NS::Error* e = nullptr;
+        _fluidThicknessPSO = _device->newRenderPipelineState(desc, &e);
+        desc->release(); vFn->release(); fFn->release();
+        if (!_fluidThicknessPSO) {
+            std::fprintf(stderr, "mtlphys: failed to build thickness PSO: %s\n",
+                         e ? e->localizedDescription()->utf8String() : "unknown");
+            std::abort();
+        }
+    }
+
+    // Wireframe-box pipeline. Same color/depth formats as the composite (we
+    // share its render pass), with alpha blending so the lines sit softly
+    // over the fluid color.
+    {
+        auto vName = NS::String::string("wireBoxVertex",   NS::UTF8StringEncoding);
+        auto fName = NS::String::string("wireBoxFragment", NS::UTF8StringEncoding);
+        auto vFn   = _library->newFunction(vName);
+        auto fFn   = _library->newFunction(fName);
+        auto desc  = MTL::RenderPipelineDescriptor::alloc()->init();
+        desc->setVertexFunction(vFn);
+        desc->setFragmentFunction(fFn);
+        auto color = desc->colorAttachments()->object(0);
+        color->setPixelFormat(MTL::PixelFormatBGRA8Unorm_sRGB);
+        color->setBlendingEnabled(true);
+        color->setRgbBlendOperation(MTL::BlendOperationAdd);
+        color->setAlphaBlendOperation(MTL::BlendOperationAdd);
+        color->setSourceRGBBlendFactor(MTL::BlendFactorSourceAlpha);
+        color->setSourceAlphaBlendFactor(MTL::BlendFactorSourceAlpha);
+        color->setDestinationRGBBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
+        color->setDestinationAlphaBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
+        desc->setDepthAttachmentPixelFormat(MTL::PixelFormatDepth32Float);
+        NS::Error* e = nullptr;
+        _wireBoxPSO = _device->newRenderPipelineState(desc, &e);
+        desc->release(); vFn->release(); fFn->release();
+        if (!_wireBoxPSO) {
+            std::fprintf(stderr, "mtlphys: failed to build wireBox PSO: %s\n",
+                         e ? e->localizedDescription()->utf8String() : "unknown");
+            std::abort();
+        }
+    }
+
+    // Depth-stencil states.
     {
         auto d = MTL::DepthStencilDescriptor::alloc()->init();
         d->setDepthCompareFunction(MTL::CompareFunctionLess);
         d->setDepthWriteEnabled(true);
         _fluidDepthDSS = _device->newDepthStencilState(d);
+        d->release();
+    }
+    {   // Composite: write depth (so wire box can occlude correctly), no test.
+        auto d = MTL::DepthStencilDescriptor::alloc()->init();
+        d->setDepthCompareFunction(MTL::CompareFunctionAlways);
+        d->setDepthWriteEnabled(true);
+        _compositeDSS = _device->newDepthStencilState(d);
+        d->release();
+    }
+    {   // Wire box: depth-test against composite's fluid depth, don't write.
+        auto d = MTL::DepthStencilDescriptor::alloc()->init();
+        d->setDepthCompareFunction(MTL::CompareFunctionLessEqual);
+        d->setDepthWriteEnabled(false);
+        _wireBoxDSS = _device->newDepthStencilState(d);
         d->release();
     }
     {
@@ -208,7 +283,7 @@ void Engine::buildPipelines() {
 void Engine::ensureRenderTargets(uint32_t w, uint32_t h) {
     if (w == _rtWidth && h == _rtHeight && _depthLinearTex) return;
     auto rel = [](auto*& t) { if (t) { t->release(); t = nullptr; } };
-    rel(_depthLinearTex); rel(_depthAttachmentTex); rel(_smoothedDepthTex);
+    rel(_depthLinearTex); rel(_depthAttachmentTex); rel(_smoothedDepthTex); rel(_thicknessTex);
 
     auto desc = MTL::TextureDescriptor::alloc()->init();
     desc->setTextureType(MTL::TextureType2D);
@@ -220,6 +295,9 @@ void Engine::ensureRenderTargets(uint32_t w, uint32_t h) {
     desc->setPixelFormat(MTL::PixelFormatR32Float);
     _depthLinearTex   = _device->newTexture(desc);
     _smoothedDepthTex = _device->newTexture(desc);
+
+    desc->setPixelFormat(MTL::PixelFormatR16Float);
+    _thicknessTex     = _device->newTexture(desc);
 
     desc->setPixelFormat(MTL::PixelFormatDepth32Float);
     desc->setUsage(MTL::TextureUsageRenderTarget);
@@ -590,11 +668,14 @@ void Engine::render(MTL::CommandBuffer* cmd,
     ensureRenderTargets(pixelWidth, pixelHeight);
 
     // ---- Camera ----
+    // Frame the entire 6×9×6 simulation box: aim at box center (y=1.5),
+    // pull back far enough that the 9-unit vertical extent fits the FOV
+    // with margin. Slight downward look from y=4 gives a 3/4 perspective.
     const float fovY = 1.0f;
-    const float r    = 9.0f;
+    const float r    = 13.0f;
     const float a    = timeSeconds * 0.3f;
-    const simd::float3 eye{ r * std::cos(a), 3.0f, r * std::sin(a) };
-    const simd::float3 center{ 0, 0, 0 };
+    const simd::float3 eye{ r * std::cos(a), 4.0f, r * std::sin(a) };
+    const simd::float3 center{ 0, 1.5f, 0 };
     const simd::float3 upV{ 0, 1, 0 };
 
     RenderUniforms u{};
@@ -652,14 +733,50 @@ void Engine::render(MTL::CommandBuffer* cmd,
         enc->endEncoding();
     }
 
-    // ---- Pass 3: composite to the MTKView drawable ----
+    // ---- Pass 2b: thickness (additive Gaussian per particle) ----
+    {
+        auto desc = MTL::RenderPassDescriptor::alloc()->init();
+        auto color = desc->colorAttachments()->object(0);
+        color->setTexture(_thicknessTex);
+        color->setLoadAction(MTL::LoadActionClear);
+        color->setStoreAction(MTL::StoreActionStore);
+        color->setClearColor(MTL::ClearColor(0, 0, 0, 1));
+
+        auto* enc = cmd->renderCommandEncoder(desc);
+        desc->release();
+        enc->setRenderPipelineState(_fluidThicknessPSO);
+        enc->setVertexBuffer(_positions, 0, 0);
+        enc->setVertexBytes(&u, sizeof(u), 1);
+        enc->drawPrimitives(MTL::PrimitiveTypeTriangle,
+                            NS::UInteger(0), NS::UInteger(6),
+                            NS::UInteger(_particleCount));
+        enc->endEncoding();
+    }
+
+    // ---- Pass 3: composite + bounding box (single encoder) ----
     {
         auto* enc = cmd->renderCommandEncoder(finalPassDesc);
+
+        // 3a. Fullscreen composite — writes color and fluid-surface NDC depth.
         enc->setRenderPipelineState(_fluidCompositePSO);
-        enc->setDepthStencilState(_passthroughDSS);
+        enc->setDepthStencilState(_compositeDSS);
         enc->setFragmentTexture(_smoothedDepthTex, 0);
+        enc->setFragmentTexture(_thicknessTex,     1);
         enc->setFragmentBytes(&u, sizeof(u), 1);
         enc->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0), NS::UInteger(3));
+
+        // 3b. Bounding-box wireframe — 12 lines, depth-tested against the
+        // fluid surface. Lines are visible everywhere except where they sit
+        // behind the fluid (then occluded), giving a "fluid in a glass tank" feel.
+        const simd::float3 bMin = kBoundsMin;
+        const simd::float3 bMax = kBoundsMax;
+        enc->setRenderPipelineState(_wireBoxPSO);
+        enc->setDepthStencilState(_wireBoxDSS);
+        enc->setVertexBytes(&u,    sizeof(u),    1);
+        enc->setVertexBytes(&bMin, sizeof(bMin), 2);
+        enc->setVertexBytes(&bMax, sizeof(bMax), 3);
+        enc->drawPrimitives(MTL::PrimitiveTypeLine, NS::UInteger(0), NS::UInteger(24));
+
         enc->endEncoding();
     }
 }
