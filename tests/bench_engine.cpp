@@ -55,7 +55,7 @@ TEST_CASE("integrator throughput") {
     for (uint32_t n : { 10'000u, 100'000u, 1'000'000u }) {
         Engine e(device());
         e.reset(n);
-        auto s = benchEncoded([&](MTL::CommandBuffer* cmd) { e.step(cmd, 1.0f / 480.0f); });
+        auto s = benchEncoded([&](MTL::CommandBuffer* cmd) { e.integrate(cmd, 1.0f / 480.0f); });
         printBenchRow("integrator", n, s);
     }
 }
@@ -77,10 +77,11 @@ TEST_CASE("spatial hash throughput (full 7-stage pass)") {
     }
 }
 
-TEST_CASE("frame time (sim + hash)") {
-    for (uint32_t n : { 100'000u, 1'000'000u }) {
+TEST_CASE("PBF full step (predict + hash + 3 solver iters + finalize)") {
+    for (uint32_t n : { 10'000u, 100'000u, 1'000'000u }) {
         Engine e(device());
         e.reset(n);
+        // Settle: a few steps so neighbor density is realistic.
         for (int i = 0; i < 10; ++i) {
             auto* cmd = queue()->commandBuffer();
             e.step(cmd, 1.0f / 240.0f);
@@ -89,9 +90,8 @@ TEST_CASE("frame time (sim + hash)") {
         }
         auto s = benchEncoded([&](MTL::CommandBuffer* cmd) {
             e.step(cmd, 1.0f / 240.0f);
-            e.buildSpatialHash(cmd);
         });
-        printBenchRow("sim+hash", n, s);
+        printBenchRow("pbf_step", n, s);
     }
 }
 

@@ -46,6 +46,28 @@ struct alignas(16) SpatialParams {
     uint32_t   maxNeighborsForViz; // count saturates here for color ramp
 };
 
+// PBF (Position-Based Fluids) per-step uniforms. Layout pads each float3 to
+// 16 bytes, matching MSL's float3 alignment.
+struct alignas(16) PBFParams {
+    mp::float3 gravity;          // m/s^2
+    float      dt;               // seconds
+    mp::float3 boundsMin;
+    float      invDt;            // 1/dt (precomputed for finalize)
+    mp::float3 boundsMax;
+    float      h;                // smoothing length
+    float      h2;               // h^2 (precomputed)
+    float      poly6Norm;        // 315 / (64*pi*h^9)
+    float      spikyGradNorm;    // 45 / (pi*h^6)
+    float      restDensity;      // rho_0
+    float      invRestDensity;   // 1 / rho_0
+    float      epsilon;          // CFM relaxation
+    float      damping;          // velocity damping at finalize (0..1, multiplicative)
+    uint32_t   particleCount;
+    uint32_t   _pad0;
+    uint32_t   _pad1;
+    uint32_t   _pad2;
+};
+
 struct alignas(16) RenderUniforms {
     mp::float4x4 viewProj;
     mp::float3   cameraPos;

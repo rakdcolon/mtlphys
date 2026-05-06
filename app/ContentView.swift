@@ -26,13 +26,11 @@ private struct HUDOverlay: View {
             Text("\(hud.particleCount) particles")
                 .font(.system(size: 12, design: .monospaced))
             Divider().frame(width: 180).background(.white.opacity(0.2))
-            Text(String(format: "sim    %6.2f ms", hud.simMs))
-                .font(.system(size: 12, design: .monospaced))
-            Text(String(format: "hash   %6.2f ms", hud.hashMs))
+            Text(String(format: "pbf    %6.2f ms", hud.simMs))
                 .font(.system(size: 12, design: .monospaced))
             Text(String(format: "render %6.2f ms", hud.renderMs))
                 .font(.system(size: 12, design: .monospaced))
-            Text(String(format: "total  %6.2f ms / 8.33 budget", hud.simMs + hud.hashMs + hud.renderMs))
+            Text(String(format: "total  %6.2f ms / 8.33 budget", hud.simMs + hud.renderMs))
                 .font(.system(size: 11, design: .monospaced))
                 .foregroundStyle(.white.opacity(0.6))
         }
@@ -47,6 +45,5 @@ final class PerfHUD: ObservableObject {
     @Published var fps: Double = 0
     @Published var particleCount: Int = 0
     @Published var simMs: Double = 0
-    @Published var hashMs: Double = 0
     @Published var renderMs: Double = 0
 }

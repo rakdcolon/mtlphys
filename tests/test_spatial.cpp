@@ -16,19 +16,19 @@
 using namespace mtlphys;
 using namespace mtlphys::test;
 
-// Engine bakes these in as compile-time constants. Mirrored here so tests can
-// recompute hashes without the engine having to expose them.
+// Engine bakes these in as compile-time constants. Mirrored here for the
+// hash-recomputation reference; cellSize is read from the engine to keep them
+// in sync.
 namespace {
 constexpr simd::float3 kBoundsMin{ -3.0f, -3.0f, -3.0f };
 constexpr simd::float3 kBoundsMax{  3.0f,  6.0f,  3.0f };
-constexpr float        kCellSize = 0.08f;
 
-simd::uint3 gridDim() {
+simd::uint3 gridDim(float cellSize) {
     auto extent = kBoundsMax - kBoundsMin;
     return simd::uint3{
-        uint32_t(std::ceil(extent.x / kCellSize)),
-        uint32_t(std::ceil(extent.y / kCellSize)),
-        uint32_t(std::ceil(extent.z / kCellSize)),
+        uint32_t(std::ceil(extent.x / cellSize)),
+        uint32_t(std::ceil(extent.y / cellSize)),
+        uint32_t(std::ceil(extent.z / cellSize)),
     };
 }
 
@@ -60,10 +60,11 @@ TEST_CASE("cell hash matches CPU reference") {
     seedAndHash(e, ps);
     auto hashes = readBuffer<uint32_t>(e.cellHashesBuffer(), ps.size());
 
-    auto gd = gridDim();
+    const float cs = e.cellSize();
+    auto gd = gridDim(cs);
     for (size_t i = 0; i < ps.size(); ++i) {
         simd::float3 p{ ps[i].x, ps[i].y, ps[i].z };
-        uint32_t expected = cpuCellHash(p, kBoundsMin, kCellSize, gd);
+        uint32_t expected = cpuCellHash(p, kBoundsMin, cs, gd);
         CHECK(hashes[i] == expected);
     }
 }
@@ -112,9 +113,10 @@ TEST_CASE("isolated particles have zero neighbors") {
 
 TEST_CASE("close pair counts each other as neighbor") {
     Engine e(device());
+    const float cs = e.cellSize();
     std::vector<simd::float4> ps{
-        simd_make_float4(0.00f, 0.0f, 0.0f, 1),
-        simd_make_float4(0.05f, 0.0f, 0.0f, 1),  // 0.05 < cellSize=0.08
+        simd_make_float4(0.00f,        0.0f, 0.0f, 1),
+        simd_make_float4(cs * 0.5f,    0.0f, 0.0f, 1),  // half a cell apart
     };
     seedAndHash(e, ps);
     auto neighbors = readBuffer<uint32_t>(e.neighborCountsBuffer(), ps.size());
@@ -125,11 +127,10 @@ TEST_CASE("close pair counts each other as neighbor") {
 TEST_CASE("3x3x3 lattice — center sees only face neighbors") {
     Engine e(device());
     // Spacing just under cellSize. Distances from center:
-    //   face²   = s²            < cellSize² → INSIDE radius
-    //   edge²   = 2s²           > cellSize² → outside
-    //   corner² = 3s²           > cellSize² → outside
-    // Center should see exactly 6 face-adjacent neighbors.
-    const float s = kCellSize * 0.99f;
+    //   face²   = s²   < cellSize² → INSIDE radius
+    //   edge²   = 2s²  > cellSize² → outside
+    //   corner² = 3s²  > cellSize² → outside
+    const float s = e.cellSize() * 0.99f;
     std::vector<simd::float4> ps;
     for (int z = -1; z <= 1; ++z)
         for (int y = -1; y <= 1; ++y)
@@ -138,9 +139,7 @@ TEST_CASE("3x3x3 lattice — center sees only face neighbors") {
 
     seedAndHash(e, ps);
     auto neighbors = readBuffer<uint32_t>(e.neighborCountsBuffer(), ps.size());
-    CHECK(neighbors[13] == 6u);                  // index 13 = (0,0,0)
-
-    // Sanity: corner particles see strictly fewer than the center.
+    CHECK(neighbors[13] == 6u);
     CHECK(neighbors[0]  < neighbors[13]);
     CHECK(neighbors[26] < neighbors[13]);
 }

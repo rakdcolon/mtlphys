@@ -60,7 +60,7 @@ TEST_CASE("freefall matches CPU reference for 100 steps") {
 
     for (int i = 0; i < N; ++i) {
         auto* cmd = queue()->commandBuffer();
-        e.step(cmd, dt);
+        e.integrate(cmd, dt);
         cmd->commit();
         cmd->waitUntilCompleted();
         cpuStep(q, dt);
@@ -88,7 +88,7 @@ TEST_CASE("particle bounces off the floor with restitution") {
     vel[0] = simd_make_float4(0, -10.0f, 0, 0);
 
     auto* cmd = queue()->commandBuffer();
-    e.step(cmd, 0.05f);
+    e.integrate(cmd, 0.05f);
     cmd->commit();
     cmd->waitUntilCompleted();
 

@@ -36,7 +36,6 @@ final class Renderer: NSObject, MTKViewDelegate {
 
     private let timingLock = NSLock()
     private var simAccum:    CFTimeInterval = 0
-    private var hashAccum:   CFTimeInterval = 0
     private var renderAccum: CFTimeInterval = 0
     private var timingCount: Int = 0
 
@@ -71,13 +70,12 @@ final class Renderer: NSObject, MTKViewDelegate {
         let t      = Float(now - startTime)
         let aspect = Float(view.drawableSize.width / max(view.drawableSize.height, 1))
 
-        // ---- Sim CB: substepped integrator ----
+        // ---- PBF step CB: predict → spatial hash → 3 solver iters → finalize ----
+        // Clamp dt for stability — early frames or stalls can spike dt past the
+        // safe SPH timestep, which causes blow-up. 1/120s ceiling.
+        let stepDt = min(dt, 1.0 / 120.0)
         guard let simCmd = commandQueue.makeCommandBuffer() else { return }
-        let substeps = 4
-        let subDt = dt / Float(substeps)
-        for _ in 0..<substeps {
-            engine.step(with: simCmd, dt: subDt)
-        }
+        engine.step(with: simCmd, dt: stepDt)
         simCmd.addCompletedHandler { [weak self] cb in
             guard let self else { return }
             let elapsed = cb.gpuEndTime - cb.gpuStartTime
@@ -86,18 +84,6 @@ final class Renderer: NSObject, MTKViewDelegate {
             self.timingLock.unlock()
         }
         simCmd.commit()
-
-        // ---- Spatial-hash CB: hash → count → scan → scatter → neighbors ----
-        guard let hashCmd = commandQueue.makeCommandBuffer() else { return }
-        engine.buildSpatialHash(with: hashCmd)
-        hashCmd.addCompletedHandler { [weak self] cb in
-            guard let self else { return }
-            let elapsed = cb.gpuEndTime - cb.gpuStartTime
-            self.timingLock.lock()
-            self.hashAccum += elapsed
-            self.timingLock.unlock()
-        }
-        hashCmd.commit()
 
         // ---- Render CB ----
         guard let renderCmd = commandQueue.makeCommandBuffer() else { return }
@@ -123,16 +109,14 @@ final class Renderer: NSObject, MTKViewDelegate {
             timingLock.lock()
             let n = max(1, timingCount)
             let simMs    = (simAccum    / Double(n)) * 1000.0
-            let hashMs   = (hashAccum   / Double(n)) * 1000.0
             let renderMs = (renderAccum / Double(n)) * 1000.0
-            simAccum = 0; hashAccum = 0; renderAccum = 0; timingCount = 0
+            simAccum = 0; renderAccum = 0; timingCount = 0
             timingLock.unlock()
 
             Task { @MainActor in
                 self.hud.fps           = measuredFps
                 self.hud.particleCount = count
                 self.hud.simMs         = simMs
-                self.hud.hashMs        = hashMs
                 self.hud.renderMs      = renderMs
             }
             frameCounter = 0

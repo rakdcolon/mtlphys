@@ -15,15 +15,31 @@ using namespace mtlphys;
 
 namespace {
 
-// Compute / dispatch tunables. kThreadgroupSize is the per-particle dispatch
-// width. The scan-chunk size lives on Engine (so tests can see it) and must
-// match the kChunkSize constant in Spatial.metal — they cannot diverge.
 constexpr uint32_t kThreadgroupSize = 256;
 constexpr uint32_t kScanChunkSize   = mtlphys::Engine::kScanChunkSize;
 
-uint32_t roundUp(uint32_t n, uint32_t mult) {
-    return ((n + mult - 1) / mult) * mult;
-}
+// ---- Sim/PBF tunables. Edit in one place; both engine and tests read these.
+constexpr simd::float3 kBoundsMin{ -3.0f, -3.0f, -3.0f };
+constexpr simd::float3 kBoundsMax{  3.0f,  6.0f,  3.0f };
+constexpr float        kCellSize       = 0.10f;     // = h
+constexpr float        kParticleRadius = 0.04f;
+constexpr uint32_t     kMaxNeighborsForViz = 60;
+
+constexpr float        kSmoothingH    = 0.10f;      // SPH smoothing length
+// rest density derived analytically: 26 neighbors of a cubic-grid particle at
+// spacing 0.5*h all sit inside the kernel, sum of poly6 contributions ≈ 8072.
+constexpr float        kRestDensity   = 8000.0f;
+// CFM relaxation. Higher ε → more compliant fluid (less rigid). 600 was too
+// stiff and made the cube behave like a falling solid.
+constexpr float        kEpsilonCFM    = 1500.0f;
+constexpr float        kPBFDamping    = 0.992f;    // light damping → waves persist
+// 3 iters: enough incompressibility for waves to propagate cleanly without
+// stiffening the cube into a solid.
+constexpr uint32_t     kSolverIters   = 3;
+
+constexpr float kPi = 3.14159265358979323846f;
+
+uint32_t roundUp(uint32_t n, uint32_t mult) { return ((n + mult - 1) / mult) * mult; }
 
 simd::float4x4 perspective(float fovY, float aspect, float zNear, float zFar) {
     const float ys = 1.0f / std::tan(fovY * 0.5f);
@@ -49,18 +65,11 @@ simd::float4x4 lookAt(simd::float3 eye, simd::float3 center, simd::float3 up) {
     };
 }
 
-// Sim/spatial constants (kept in one place so they can't disagree).
-constexpr simd::float3 kBoundsMin{ -3.0f, -3.0f, -3.0f };
-constexpr simd::float3 kBoundsMax{  3.0f,  6.0f,  3.0f };
-constexpr float        kCellSize       = 0.08f;   // = 2 * particle radius
-constexpr float        kParticleRadius = 0.04f;
-constexpr uint32_t     kMaxNeighborsForViz = 60;  // density saturation point
-
 MTL::ComputePipelineState* makeComputePSO(MTL::Device* dev, MTL::Library* lib, const char* name) {
     auto fnName = NS::String::string(name, NS::UTF8StringEncoding);
     auto fn     = lib->newFunction(fnName);
     if (!fn) {
-        std::fprintf(stderr, "mtlphys: missing kernel '%s' in default library\n", name);
+        std::fprintf(stderr, "mtlphys: missing kernel '%s'\n", name);
         std::abort();
     }
     NS::Error* err = nullptr;
@@ -82,23 +91,27 @@ void zeroBuffer(MTL::CommandBuffer* cmd, MTL::Buffer* buf, size_t bytes) {
 
 } // namespace
 
+float Engine::cellSize() const noexcept { return kCellSize; }
+
 Engine::Engine(MTL::Device* device) : _device(device) {
     assert(device);
     _queue = _device->newCommandQueue();
     buildPipelines();
-    reset(1'000'000);
+    reset(200'000);
 }
 
 Engine::~Engine() {
     auto rel = [](auto*& p) { if (p) { p->release(); p = nullptr; } };
-    rel(_positions); rel(_velocities); rel(_params);
+    rel(_positions); rel(_velocities); rel(_prevPositions); rel(_params); rel(_pbfParams);
     rel(_cellHashes); rel(_cellCounts); rel(_cellStart); rel(_cellCursor);
     rel(_chunkSums); rel(_sortedIndex); rel(_sortedPositions);
     rel(_neighborCounts); rel(_spatialParams);
+    rel(_lambdas); rel(_sortedLambdas);
     rel(_integratePSO); rel(_hashCellsPSO); rel(_countCellsPSO);
     rel(_scanChunkPSO); rel(_scanChunkSumsPSO); rel(_addChunkOffsetsPSO);
-    rel(_scatterParticlesPSO); rel(_gatherPositionsPSO);
-    rel(_countNeighborsPSO); rel(_renderPSO);
+    rel(_scatterParticlesPSO); rel(_gatherPositionsPSO); rel(_countNeighborsPSO);
+    rel(_predictPSO); rel(_densityLambdaPSO); rel(_gatherLambdasPSO);
+    rel(_applyDeltaPSO); rel(_finalizePSO); rel(_renderPSO);
     rel(_library); rel(_queue);
 }
 
@@ -125,6 +138,11 @@ void Engine::buildPipelines() {
     _scatterParticlesPSO = makeComputePSO(_device, _library, "scatterParticles");
     _gatherPositionsPSO  = makeComputePSO(_device, _library, "gatherPositions");
     _countNeighborsPSO   = makeComputePSO(_device, _library, "countNeighbors");
+    _predictPSO          = makeComputePSO(_device, _library, "predictPositions");
+    _densityLambdaPSO    = makeComputePSO(_device, _library, "densityLambda");
+    _gatherLambdasPSO    = makeComputePSO(_device, _library, "gatherLambdas");
+    _applyDeltaPSO       = makeComputePSO(_device, _library, "applyDelta");
+    _finalizePSO         = makeComputePSO(_device, _library, "finalizeStep");
 
     auto vertName = NS::String::string("particleVertex",   NS::UTF8StringEncoding);
     auto fragName = NS::String::string("particleFragment", NS::UTF8StringEncoding);
@@ -161,22 +179,22 @@ void Engine::buildBuffers(uint32_t particleCount) {
     const size_t vecBytes    = paddedCount * sizeof(simd::float4);
 
     auto rel = [](auto*& p) { if (p) { p->release(); p = nullptr; } };
-    rel(_positions); rel(_velocities); rel(_params);
+    rel(_positions); rel(_velocities); rel(_prevPositions); rel(_params); rel(_pbfParams);
 
-    _positions  = _device->newBuffer(vecBytes,         MTL::ResourceStorageModeShared);
-    _velocities = _device->newBuffer(vecBytes,         MTL::ResourceStorageModeShared);
-    _params     = _device->newBuffer(sizeof(SimParams), MTL::ResourceStorageModeShared);
+    _positions     = _device->newBuffer(vecBytes,             MTL::ResourceStorageModeShared);
+    _velocities    = _device->newBuffer(vecBytes,             MTL::ResourceStorageModeShared);
+    _prevPositions = _device->newBuffer(vecBytes,             MTL::ResourceStorageModePrivate);
+    _params        = _device->newBuffer(sizeof(SimParams),    MTL::ResourceStorageModeShared);
+    _pbfParams     = _device->newBuffer(sizeof(PBFParams),    MTL::ResourceStorageModeShared);
 }
 
 void Engine::buildSpatialBuffers() {
-    // Grid sized to the simulation bounds.
     const simd::float3 extent = kBoundsMax - kBoundsMin;
     const uint32_t gx = uint32_t(std::ceil(extent.x / kCellSize));
     const uint32_t gy = uint32_t(std::ceil(extent.y / kCellSize));
     const uint32_t gz = uint32_t(std::ceil(extent.z / kCellSize));
     _totalCells = gx * gy * gz;
 
-    // Scan operates on (totalCells + 1) entries so that cellStart[totalCells] == N.
     const uint32_t scanLen = _totalCells + 1;
     _scanChunkCount = (scanLen + kScanChunkSize - 1) / kScanChunkSize;
     if (_scanChunkCount > kScanChunkSize) {
@@ -191,8 +209,10 @@ void Engine::buildSpatialBuffers() {
     rel(_cellHashes); rel(_cellCounts); rel(_cellStart); rel(_cellCursor);
     rel(_chunkSums); rel(_sortedIndex); rel(_sortedPositions);
     rel(_neighborCounts); rel(_spatialParams);
+    rel(_lambdas); rel(_sortedLambdas);
 
     const size_t particleBytes  = roundUp(_particleCount, kThreadgroupSize) * sizeof(uint32_t);
+    const size_t particleFloatBs= roundUp(_particleCount, kThreadgroupSize) * sizeof(float);
     const size_t particleVec4Bs = roundUp(_particleCount, kThreadgroupSize) * sizeof(simd::float4);
     const size_t cellBytesP1    = scanLen * sizeof(uint32_t);
     const size_t cellBytes      = _totalCells * sizeof(uint32_t);
@@ -207,13 +227,14 @@ void Engine::buildSpatialBuffers() {
     _sortedPositions = _device->newBuffer(particleVec4Bs,        MTL::ResourceStorageModePrivate);
     _neighborCounts  = _device->newBuffer(particleBytes,         MTL::ResourceStorageModePrivate);
     _spatialParams   = _device->newBuffer(sizeof(SpatialParams), MTL::ResourceStorageModeShared);
+    _lambdas         = _device->newBuffer(particleFloatBs,       MTL::ResourceStorageModePrivate);
+    _sortedLambdas   = _device->newBuffer(particleFloatBs,       MTL::ResourceStorageModePrivate);
 
-    // Fill the SpatialParams once — geometry doesn't change between frames yet.
     auto* sp = static_cast<SpatialParams*>(_spatialParams->contents());
     sp->gridOrigin         = mp::float3{ kBoundsMin.x, kBoundsMin.y, kBoundsMin.z };
     sp->cellSize           = kCellSize;
     sp->invCellSize        = 1.0f / kCellSize;
-    sp->neighborRadiusSq   = kCellSize * kCellSize;     // ~= (2 * particleRadius)^2
+    sp->neighborRadiusSq   = kSmoothingH * kSmoothingH;
     sp->particleCount      = _particleCount;
     sp->totalCells         = _totalCells;
     sp->gridDim            = mp::uint3{ gx, gy, gz };
@@ -224,18 +245,60 @@ void Engine::seedParticles(uint32_t particleCount) {
     auto* pos = static_cast<simd::float4*>(_positions->contents());
     auto* vel = static_cast<simd::float4*>(_velocities->contents());
 
-    std::mt19937 rng(0xC0FFEE);
-    std::uniform_real_distribution<float> ux(-2.0f, 2.0f);
-    std::uniform_real_distribution<float> uy( 1.0f, 5.0f);
-    std::uniform_real_distribution<float> uz(-2.0f, 2.0f);
+    // PBF requires roughly uniform initial density that matches kRestDensity.
+    // Random sampling produces clusters whose density spikes the constraint
+    // and blows up the solver. We lay particles in a regular cubic block at
+    // half-h spacing — the same packing the rest-density was tuned for.
+    const float    spacing  = kSmoothingH * 0.5f;
+    const uint32_t side     = uint32_t(std::ceil(std::cbrt(double(particleCount))));
+    const float    halfBlk  = 0.5f * (side - 1) * spacing;
+    const float    topY     = 2.0f;   // shorter fall = lower impact velocity
 
-    for (uint32_t i = 0; i < particleCount; ++i) {
-        pos[i] = simd::float4{ ux(rng), uy(rng), uz(rng), 1.0f };
-        vel[i] = simd::float4{ 0, 0, 0, 0 };
+    uint32_t i = 0;
+    for (uint32_t y = 0; y < side && i < particleCount; ++y) {
+        for (uint32_t z = 0; z < side && i < particleCount; ++z) {
+            for (uint32_t x = 0; x < side && i < particleCount; ++x) {
+                pos[i] = simd::float4{
+                    -halfBlk + x * spacing,
+                    topY     - y * spacing,
+                    -halfBlk + z * spacing,
+                    1.0f
+                };
+                vel[i] = simd::float4{ 0, 0, 0, 0 };
+                ++i;
+            }
+        }
     }
 }
 
-void Engine::step(MTL::CommandBuffer* cmd, float dt) {
+void Engine::writePBFParams(float dt) {
+    auto* pp = static_cast<PBFParams*>(_pbfParams->contents());
+    const float h  = kSmoothingH;
+    const float h2 = h * h;
+    const float h3 = h2 * h;
+    const float h6 = h3 * h3;
+    const float h9 = h6 * h3;
+    pp->gravity        = mp::float3{ 0.0f, -9.81f, 0.0f };
+    pp->dt             = dt;
+    pp->boundsMin      = mp::float3{ kBoundsMin.x, kBoundsMin.y, kBoundsMin.z };
+    pp->invDt          = 1.0f / dt;
+    pp->boundsMax      = mp::float3{ kBoundsMax.x, kBoundsMax.y, kBoundsMax.z };
+    pp->h              = h;
+    pp->h2             = h2;
+    pp->poly6Norm      = 315.0f / (64.0f * kPi * h9);
+    pp->spikyGradNorm  = 45.0f  / (kPi * h6);
+    pp->restDensity    = kRestDensity;
+    pp->invRestDensity = 1.0f / kRestDensity;
+    pp->epsilon        = kEpsilonCFM;
+    pp->damping        = kPBFDamping;
+    pp->particleCount  = _particleCount;
+}
+
+// ---------------------------------------------------------------------------
+// integrate (legacy semi-implicit Euler — kept for tests)
+// ---------------------------------------------------------------------------
+
+void Engine::integrate(MTL::CommandBuffer* cmd, float dt) {
     auto* p = static_cast<SimParams*>(_params->contents());
     p->gravity       = mp::float3{ 0.0f, -9.81f, 0.0f };
     p->dt            = dt;
@@ -249,51 +312,40 @@ void Engine::step(MTL::CommandBuffer* cmd, float dt) {
     enc->setBuffer(_positions,  0, 0);
     enc->setBuffer(_velocities, 0, 1);
     enc->setBuffer(_params,     0, 2);
-
     const uint32_t padded = roundUp(_particleCount, kThreadgroupSize);
-    enc->dispatchThreads(MTL::Size(padded, 1, 1),
-                         MTL::Size(kThreadgroupSize, 1, 1));
+    enc->dispatchThreads(MTL::Size(padded, 1, 1), MTL::Size(kThreadgroupSize, 1, 1));
     enc->endEncoding();
 }
 
+// ---------------------------------------------------------------------------
+// buildSpatialHash (unchanged from W2)
+// ---------------------------------------------------------------------------
+
 void Engine::buildSpatialHash(MTL::CommandBuffer* cmd) {
-    const uint32_t scanLen        = _totalCells + 1;
-    const uint32_t paddedScanLen  = _scanChunkCount * kScanChunkSize;
+    const uint32_t scanLen         = _totalCells + 1;
+    const uint32_t paddedScanLen   = _scanChunkCount * kScanChunkSize;
     const uint32_t paddedParticles = roundUp(_particleCount, kThreadgroupSize);
 
-    // Zero the buffers we'll atomically fill this frame.
-    zeroBuffer(cmd, _cellCounts, _totalCells * sizeof(uint32_t) + sizeof(uint32_t));
+    zeroBuffer(cmd, _cellCounts, scanLen * sizeof(uint32_t));
     zeroBuffer(cmd, _cellCursor, _totalCells * sizeof(uint32_t));
-    // chunkSums is fully overwritten by the scan; cellStart is fully overwritten
-    // by the scan + add-back, so neither needs zeroing.
 
-    // 1. Hash
-    {
-        auto* enc = cmd->computeCommandEncoder();
+    {   auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(_hashCellsPSO);
         enc->setBuffer(_positions,     0, 0);
         enc->setBuffer(_cellHashes,    0, 1);
         enc->setBuffer(_spatialParams, 0, 7);
         enc->dispatchThreads(MTL::Size(paddedParticles, 1, 1),
                              MTL::Size(kThreadgroupSize, 1, 1));
-        enc->endEncoding();
-    }
-
-    // 2. Count
-    {
-        auto* enc = cmd->computeCommandEncoder();
+        enc->endEncoding(); }
+    {   auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(_countCellsPSO);
         enc->setBuffer(_cellHashes,    0, 1);
         enc->setBuffer(_cellCounts,    0, 2);
         enc->setBuffer(_spatialParams, 0, 7);
         enc->dispatchThreads(MTL::Size(paddedParticles, 1, 1),
                              MTL::Size(kThreadgroupSize, 1, 1));
-        enc->endEncoding();
-    }
-
-    // 3. scanChunkExclusive: cellCounts -> cellStart, totals -> chunkSums
-    {
-        auto* enc = cmd->computeCommandEncoder();
+        enc->endEncoding(); }
+    {   auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(_scanChunkPSO);
         enc->setBuffer(_cellCounts, 0, 0);
         enc->setBuffer(_cellStart,  0, 1);
@@ -301,35 +353,23 @@ void Engine::buildSpatialHash(MTL::CommandBuffer* cmd) {
         enc->setBytes(&scanLen, sizeof(scanLen), 3);
         enc->dispatchThreads(MTL::Size(paddedScanLen, 1, 1),
                              MTL::Size(kScanChunkSize, 1, 1));
-        enc->endEncoding();
-    }
-
-    // 4. scanChunkSums: in-place scan over chunkSums (single threadgroup)
-    {
-        auto* enc = cmd->computeCommandEncoder();
+        enc->endEncoding(); }
+    {   auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(_scanChunkSumsPSO);
         enc->setBuffer(_chunkSums, 0, 0);
         enc->setBytes(&_scanChunkCount, sizeof(_scanChunkCount), 3);
         enc->dispatchThreads(MTL::Size(kScanChunkSize, 1, 1),
                              MTL::Size(kScanChunkSize, 1, 1));
-        enc->endEncoding();
-    }
-
-    // 5. addChunkOffsets: cellStart += chunkSums[bid] (skipping bid 0)
-    {
-        auto* enc = cmd->computeCommandEncoder();
+        enc->endEncoding(); }
+    {   auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(_addChunkOffsetsPSO);
         enc->setBuffer(_cellStart, 0, 0);
         enc->setBuffer(_chunkSums, 0, 2);
         enc->setBytes(&scanLen, sizeof(scanLen), 3);
         enc->dispatchThreads(MTL::Size(paddedScanLen, 1, 1),
                              MTL::Size(kScanChunkSize, 1, 1));
-        enc->endEncoding();
-    }
-
-    // 6. Scatter particle indices into sorted order
-    {
-        auto* enc = cmd->computeCommandEncoder();
+        enc->endEncoding(); }
+    {   auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(_scatterParticlesPSO);
         enc->setBuffer(_cellHashes,    0, 1);
         enc->setBuffer(_cellStart,     0, 3);
@@ -338,13 +378,8 @@ void Engine::buildSpatialHash(MTL::CommandBuffer* cmd) {
         enc->setBuffer(_spatialParams, 0, 7);
         enc->dispatchThreads(MTL::Size(paddedParticles, 1, 1),
                              MTL::Size(kThreadgroupSize, 1, 1));
-        enc->endEncoding();
-    }
-
-    // 7. Gather positions into sorted layout — turns the inner-loop random
-    //    gather of countNeighbors into a sequential read.
-    {
-        auto* enc = cmd->computeCommandEncoder();
+        enc->endEncoding(); }
+    {   auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(_gatherPositionsPSO);
         enc->setBuffer(_positions,        0, 0);
         enc->setBuffer(_sortedIndex,      0, 5);
@@ -352,12 +387,8 @@ void Engine::buildSpatialHash(MTL::CommandBuffer* cmd) {
         enc->setBuffer(_sortedPositions,  0, 8);
         enc->dispatchThreads(MTL::Size(paddedParticles, 1, 1),
                              MTL::Size(kThreadgroupSize, 1, 1));
-        enc->endEncoding();
-    }
-
-    // 8. Neighbor count (density visualization, prep for W3 constraint solver)
-    {
-        auto* enc = cmd->computeCommandEncoder();
+        enc->endEncoding(); }
+    {   auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(_countNeighborsPSO);
         enc->setBuffer(_positions,        0, 0);
         enc->setBuffer(_cellStart,        0, 3);
@@ -367,8 +398,89 @@ void Engine::buildSpatialHash(MTL::CommandBuffer* cmd) {
         enc->setBuffer(_sortedPositions,  0, 8);
         enc->dispatchThreads(MTL::Size(paddedParticles, 1, 1),
                              MTL::Size(kThreadgroupSize, 1, 1));
-        enc->endEncoding();
+        enc->endEncoding(); }
+}
+
+// ---------------------------------------------------------------------------
+// step — full PBF pipeline
+// ---------------------------------------------------------------------------
+
+void Engine::step(MTL::CommandBuffer* cmd, float dt) {
+    if (dt <= 0) return;
+    writePBFParams(dt);
+    const uint32_t padded = roundUp(_particleCount, kThreadgroupSize);
+
+    // 1. Predict
+    {   auto* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(_predictPSO);
+        enc->setBuffer(_positions,      0, 0);
+        enc->setBuffer(_velocities,     0, 1);
+        enc->setBuffer(_prevPositions,  0, 2);
+        enc->setBuffer(_pbfParams,      0, 7);
+        enc->dispatchThreads(MTL::Size(padded, 1, 1),
+                             MTL::Size(kThreadgroupSize, 1, 1));
+        enc->endEncoding(); }
+
+    // 2. Spatial hash on predicted positions (also produces sortedPositions)
+    buildSpatialHash(cmd);
+
+    // 3. Solver iterations
+    for (uint32_t iter = 0; iter < kSolverIters; ++iter) {
+        // 3a. density + lambda
+        {   auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(_densityLambdaPSO);
+            enc->setBuffer(_positions,        0, 0);
+            enc->setBuffer(_cellStart,        0, 3);
+            enc->setBuffer(_sortedIndex,      0, 5);
+            enc->setBuffer(_spatialParams,    0, 7);
+            enc->setBuffer(_sortedPositions,  0, 8);
+            enc->setBuffer(_lambdas,          0, 9);
+            enc->setBuffer(_pbfParams,        0, 10);
+            enc->dispatchThreads(MTL::Size(padded, 1, 1),
+                                 MTL::Size(kThreadgroupSize, 1, 1));
+            enc->endEncoding(); }
+
+        // 3b. gather lambdas → sortedLambdas
+        {   auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(_gatherLambdasPSO);
+            enc->setBuffer(_sortedIndex,    0, 5);
+            enc->setBuffer(_spatialParams,  0, 7);
+            enc->setBuffer(_lambdas,        0, 9);
+            enc->setBuffer(_sortedLambdas,  0, 11);
+            enc->dispatchThreads(MTL::Size(padded, 1, 1),
+                                 MTL::Size(kThreadgroupSize, 1, 1));
+            enc->endEncoding(); }
+
+        // 3c. apply position correction
+        {   auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(_applyDeltaPSO);
+            enc->setBuffer(_positions,        0, 0);
+            enc->setBuffer(_cellStart,        0, 3);
+            enc->setBuffer(_sortedIndex,      0, 5);
+            enc->setBuffer(_spatialParams,    0, 7);
+            enc->setBuffer(_sortedPositions,  0, 8);
+            enc->setBuffer(_lambdas,          0, 9);
+            enc->setBuffer(_pbfParams,        0, 10);
+            enc->setBuffer(_sortedLambdas,    0, 11);
+            enc->dispatchThreads(MTL::Size(padded, 1, 1),
+                                 MTL::Size(kThreadgroupSize, 1, 1));
+            enc->endEncoding(); }
+
+        // (We do NOT re-gatherPositions per iter — neighbor positions become
+        // slightly stale across iters but stability is fine for K=3. Add a
+        // re-gather if K grows or instability appears.)
     }
+
+    // 4. Box clamp + velocity recompute + damping
+    {   auto* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(_finalizePSO);
+        enc->setBuffer(_positions,      0, 0);
+        enc->setBuffer(_velocities,     0, 1);
+        enc->setBuffer(_prevPositions,  0, 2);
+        enc->setBuffer(_pbfParams,      0, 7);
+        enc->dispatchThreads(MTL::Size(padded, 1, 1),
+                             MTL::Size(kThreadgroupSize, 1, 1));
+        enc->endEncoding(); }
 }
 
 void Engine::runExclusiveScan(MTL::CommandBuffer* cmd,
@@ -379,16 +491,14 @@ void Engine::runExclusiveScan(MTL::CommandBuffer* cmd,
     if (n == 0) return;
     if (n > kMaxScanLength) {
         std::fprintf(stderr,
-                     "mtlphys: runExclusiveScan(n=%u) exceeds 2-level cap (%u). "
-                     "Add a third hierarchy level.\n", n, kMaxScanLength);
+                     "mtlphys: runExclusiveScan(n=%u) exceeds 2-level cap (%u).\n",
+                     n, kMaxScanLength);
         std::abort();
     }
-    const uint32_t chunkCount   = (n + kScanChunkSize - 1) / kScanChunkSize;
-    const uint32_t paddedScan   = chunkCount * kScanChunkSize;
+    const uint32_t chunkCount = (n + kScanChunkSize - 1) / kScanChunkSize;
+    const uint32_t paddedScan = chunkCount * kScanChunkSize;
 
-    // Stage 1: per-chunk exclusive scan, totals to chunkSums.
-    {
-        auto* enc = cmd->computeCommandEncoder();
+    {   auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(_scanChunkPSO);
         enc->setBuffer(in,        0, 0);
         enc->setBuffer(out,       0, 1);
@@ -396,29 +506,22 @@ void Engine::runExclusiveScan(MTL::CommandBuffer* cmd,
         enc->setBytes(&n, sizeof(n), 3);
         enc->dispatchThreads(MTL::Size(paddedScan, 1, 1),
                              MTL::Size(kScanChunkSize, 1, 1));
-        enc->endEncoding();
-    }
-    // Stage 2: scan chunkSums in place (single threadgroup).
-    {
-        auto* enc = cmd->computeCommandEncoder();
+        enc->endEncoding(); }
+    {   auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(_scanChunkSumsPSO);
         enc->setBuffer(chunkSums, 0, 0);
         enc->setBytes(&chunkCount, sizeof(chunkCount), 3);
         enc->dispatchThreads(MTL::Size(kScanChunkSize, 1, 1),
                              MTL::Size(kScanChunkSize, 1, 1));
-        enc->endEncoding();
-    }
-    // Stage 3: add scanned chunkSums into the per-chunk results.
-    {
-        auto* enc = cmd->computeCommandEncoder();
+        enc->endEncoding(); }
+    {   auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(_addChunkOffsetsPSO);
         enc->setBuffer(out,       0, 0);
         enc->setBuffer(chunkSums, 0, 2);
         enc->setBytes(&n, sizeof(n), 3);
         enc->dispatchThreads(MTL::Size(paddedScan, 1, 1),
                              MTL::Size(kScanChunkSize, 1, 1));
-        enc->endEncoding();
-    }
+        enc->endEncoding(); }
 }
 
 void Engine::render(MTL::CommandBuffer* cmd,

@@ -1,8 +1,9 @@
-// Engine — owns the simulation state on the GPU and drives one step per frame.
+// Engine — owns the simulation state on the GPU and drives one PBF step per
+// frame.
 //
-// Threading model: not thread-safe. The host must call step() / hash() / render()
-// from the same thread (typically the MTKView delegate's main thread).
-// The GPU work itself is encoded onto a command buffer and dispatched async.
+// Threading model: not thread-safe. The host must call from one thread (the
+// MTKView delegate's main thread). GPU work is encoded onto a command buffer
+// and dispatched async.
 #pragma once
 
 #include <cstdint>
@@ -29,41 +30,44 @@ public:
     Engine(const Engine&) = delete;
     Engine& operator=(const Engine&) = delete;
 
-    // Reset particle state — fills positions inside the bounds, velocity zero.
     void reset(uint32_t particleCount);
 
-    // Encode one simulation step onto the given command buffer. Does NOT commit.
-    void step(MTL::CommandBuffer* cmd, float dt);
+    // Old semi-implicit Euler integrator with axis-aligned box bounds. Kept
+    // for backward compatibility (tests use it as a known-good reference).
+    void integrate(MTL::CommandBuffer* cmd, float dt);
 
-    // Encode one full spatial-hash rebuild + neighbor-count pass onto cmd.
-    // After this, neighborCounts buffer is populated and used by render().
+    // Spatial-hash rebuild: hash → count → 3-stage scan → scatter →
+    // gatherPositions → countNeighbors. Idempotent given current positions.
     void buildSpatialHash(MTL::CommandBuffer* cmd);
 
-    // Encode the particle render pass. Does NOT commit or present.
+    // Full PBF step: predict → spatial hash → 3 solver iterations → finalize.
+    // This is the headline simulation entry point.
+    void step(MTL::CommandBuffer* cmd, float dt);
+
+    // Render the particle field, colored by neighbor density.
     void render(MTL::CommandBuffer* cmd,
                 MTL::RenderPassDescriptor* passDesc,
                 float aspectRatio,
                 float timeSeconds);
 
     uint32_t particleCount() const noexcept { return _particleCount; }
+    uint32_t totalCells()    const noexcept { return _totalCells; }
+    float    cellSize()      const noexcept;
 
     // ---- Test / diagnostic accessors ----------------------------------------
-    // Read-only handles to the internal GPU buffers. Most are Private storage;
-    // tests must blit-to-Shared before reading on the CPU.
     MTL::Buffer* positionsBuffer()      const noexcept { return _positions; }
     MTL::Buffer* velocitiesBuffer()     const noexcept { return _velocities; }
+    MTL::Buffer* prevPositionsBuffer()  const noexcept { return _prevPositions; }
     MTL::Buffer* cellHashesBuffer()     const noexcept { return _cellHashes; }
     MTL::Buffer* cellStartBuffer()      const noexcept { return _cellStart; }
     MTL::Buffer* sortedIndexBuffer()    const noexcept { return _sortedIndex; }
     MTL::Buffer* neighborCountsBuffer() const noexcept { return _neighborCounts; }
+    MTL::Buffer* lambdasBuffer()        const noexcept { return _lambdas; }
 
-    uint32_t totalCells()    const noexcept { return _totalCells; }
-    static constexpr uint32_t kScanChunkSize    = 1024;
-    static constexpr uint32_t kMaxScanLength    = kScanChunkSize * kScanChunkSize;  // 2-level scan cap
+    static constexpr uint32_t kScanChunkSize = 1024;
+    static constexpr uint32_t kMaxScanLength = kScanChunkSize * kScanChunkSize;
 
     // Run only the 3-stage exclusive prefix scan on caller-provided buffers.
-    // chunkSums must hold at least ceil(n / kScanChunkSize) uints.
-    // Encodes onto cmd; caller commits and waits.
     void runExclusiveScan(MTL::CommandBuffer* cmd,
                           MTL::Buffer*        in,
                           MTL::Buffer*        out,
@@ -75,12 +79,13 @@ private:
     void buildBuffers(uint32_t particleCount);
     void buildSpatialBuffers();
     void seedParticles(uint32_t particleCount);
+    void writePBFParams(float dt);
 
-    MTL::Device*               _device              = nullptr;  // not owned
-    MTL::CommandQueue*         _queue               = nullptr;  // we own everything below
+    MTL::Device*               _device              = nullptr;
+    MTL::CommandQueue*         _queue               = nullptr;
     MTL::Library*              _library             = nullptr;
 
-    // Pipelines
+    // Compute pipelines
     MTL::ComputePipelineState* _integratePSO        = nullptr;
     MTL::ComputePipelineState* _hashCellsPSO        = nullptr;
     MTL::ComputePipelineState* _countCellsPSO       = nullptr;
@@ -90,27 +95,38 @@ private:
     MTL::ComputePipelineState* _scatterParticlesPSO = nullptr;
     MTL::ComputePipelineState* _gatherPositionsPSO  = nullptr;
     MTL::ComputePipelineState* _countNeighborsPSO   = nullptr;
+    MTL::ComputePipelineState* _predictPSO          = nullptr;
+    MTL::ComputePipelineState* _densityLambdaPSO    = nullptr;
+    MTL::ComputePipelineState* _gatherLambdasPSO    = nullptr;
+    MTL::ComputePipelineState* _applyDeltaPSO       = nullptr;
+    MTL::ComputePipelineState* _finalizePSO         = nullptr;
     MTL::RenderPipelineState*  _renderPSO           = nullptr;
 
     // Particle state
-    MTL::Buffer* _positions      = nullptr;  // float4 per particle (xyz + pad)
-    MTL::Buffer* _velocities     = nullptr;  // float4 per particle (xyz + pad)
-    MTL::Buffer* _params         = nullptr;  // SimParams uniform
+    MTL::Buffer* _positions      = nullptr;
+    MTL::Buffer* _velocities     = nullptr;
+    MTL::Buffer* _prevPositions  = nullptr;   // saved at predict, used in finalize
+    MTL::Buffer* _params         = nullptr;   // SimParams uniform (for integrate)
+    MTL::Buffer* _pbfParams      = nullptr;   // PBFParams uniform
 
     // Spatial-hash state
-    MTL::Buffer* _cellHashes     = nullptr;  // uint per particle
-    MTL::Buffer* _cellCounts     = nullptr;  // uint per cell + 1 (last slot stays 0)
-    MTL::Buffer* _cellStart      = nullptr;  // uint per cell + 1 (exclusive scan)
-    MTL::Buffer* _cellCursor     = nullptr;  // uint per cell, atomic counter for scatter
-    MTL::Buffer* _chunkSums      = nullptr;  // uint per scan-chunk
-    MTL::Buffer* _sortedIndex     = nullptr;  // uint per particle
-    MTL::Buffer* _sortedPositions = nullptr;  // float4 per particle, sorted-slot indexed
-    MTL::Buffer* _neighborCounts  = nullptr;  // uint per particle (visualization)
-    MTL::Buffer* _spatialParams  = nullptr;  // SpatialParams uniform
+    MTL::Buffer* _cellHashes     = nullptr;
+    MTL::Buffer* _cellCounts     = nullptr;
+    MTL::Buffer* _cellStart      = nullptr;
+    MTL::Buffer* _cellCursor     = nullptr;
+    MTL::Buffer* _chunkSums      = nullptr;
+    MTL::Buffer* _sortedIndex    = nullptr;
+    MTL::Buffer* _sortedPositions= nullptr;
+    MTL::Buffer* _neighborCounts = nullptr;
+    MTL::Buffer* _spatialParams  = nullptr;
 
-    uint32_t _particleCount  = 0;
-    uint32_t _totalCells     = 0;
-    uint32_t _scanChunkCount = 0;     // ceil((totalCells+1) / kChunkSize)
+    // PBF solver scratch
+    MTL::Buffer* _lambdas        = nullptr;   // float per particle
+    MTL::Buffer* _sortedLambdas  = nullptr;   // float per sorted slot
+
+    uint32_t _particleCount   = 0;
+    uint32_t _totalCells      = 0;
+    uint32_t _scanChunkCount  = 0;
 };
 
 } // namespace mtlphys
