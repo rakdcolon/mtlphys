@@ -31,11 +31,13 @@
 
 - (void)renderWithCommandBuffer:(id<MTLCommandBuffer>)cmd
             renderPassDescriptor:(MTLRenderPassDescriptor*)passDesc
+                      pixelWidth:(uint32_t)pixelWidth
+                     pixelHeight:(uint32_t)pixelHeight
                      aspectRatio:(float)aspect
                             time:(float)t {
     auto* mtlCmd  = (__bridge MTL::CommandBuffer*)cmd;
     auto* mtlPass = (__bridge MTL::RenderPassDescriptor*)passDesc;
-    _engine->render(mtlCmd, mtlPass, aspect, t);
+    _engine->render(mtlCmd, mtlPass, pixelWidth, pixelHeight, aspect, t);
 }
 
 - (void)resetWithParticleCount:(uint32_t)count {

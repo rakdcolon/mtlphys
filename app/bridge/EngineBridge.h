@@ -14,6 +14,8 @@ NS_ASSUME_NONNULL_BEGIN
 - (void)buildSpatialHashWithCommandBuffer:(id<MTLCommandBuffer>)cmd;
 - (void)renderWithCommandBuffer:(id<MTLCommandBuffer>)cmd
               renderPassDescriptor:(MTLRenderPassDescriptor*)passDesc
+                        pixelWidth:(uint32_t)pixelWidth
+                       pixelHeight:(uint32_t)pixelHeight
                        aspectRatio:(float)aspect
                               time:(float)t;
 - (void)resetWithParticleCount:(uint32_t)count;

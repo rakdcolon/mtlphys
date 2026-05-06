@@ -22,8 +22,8 @@ constexpr uint32_t kScanChunkSize   = mtlphys::Engine::kScanChunkSize;
 constexpr simd::float3 kBoundsMin{ -3.0f, -3.0f, -3.0f };
 constexpr simd::float3 kBoundsMax{  3.0f,  6.0f,  3.0f };
 constexpr float        kCellSize       = 0.10f;     // = h
-constexpr float        kParticleRadius = 0.04f;
-constexpr uint32_t     kMaxNeighborsForViz = 60;
+constexpr float        kParticleRadius = 0.035f;
+constexpr uint32_t     kMaxNeighborsForViz = 96;
 
 constexpr float        kSmoothingH    = 0.10f;      // SPH smoothing length
 // rest density derived analytically: 26 neighbors of a cubic-grid particle at
@@ -31,11 +31,11 @@ constexpr float        kSmoothingH    = 0.10f;      // SPH smoothing length
 constexpr float        kRestDensity   = 8000.0f;
 // CFM relaxation. Higher ε → more compliant fluid (less rigid). 600 was too
 // stiff and made the cube behave like a falling solid.
-constexpr float        kEpsilonCFM    = 1500.0f;
-constexpr float        kPBFDamping    = 0.992f;    // light damping → waves persist
+constexpr float        kEpsilonCFM    = 800.0f;
+constexpr float        kPBFDamping    = 0.996f;    // light damping → waves persist
 // 3 iters: enough incompressibility for waves to propagate cleanly without
 // stiffening the cube into a solid.
-constexpr uint32_t     kSolverIters   = 3;
+constexpr uint32_t     kSolverIters   = 5;
 
 constexpr float kPi = 3.14159265358979323846f;
 
@@ -104,14 +104,17 @@ Engine::~Engine() {
     auto rel = [](auto*& p) { if (p) { p->release(); p = nullptr; } };
     rel(_positions); rel(_velocities); rel(_prevPositions); rel(_params); rel(_pbfParams);
     rel(_cellHashes); rel(_cellCounts); rel(_cellStart); rel(_cellCursor);
-    rel(_chunkSums); rel(_sortedIndex); rel(_sortedPositions);
+    rel(_chunkSums); rel(_sortedIndex); rel(_sortedPositions); rel(_sortedPositionsNext);
     rel(_neighborCounts); rel(_spatialParams);
     rel(_lambdas); rel(_sortedLambdas);
     rel(_integratePSO); rel(_hashCellsPSO); rel(_countCellsPSO);
     rel(_scanChunkPSO); rel(_scanChunkSumsPSO); rel(_addChunkOffsetsPSO);
     rel(_scatterParticlesPSO); rel(_gatherPositionsPSO); rel(_countNeighborsPSO);
-    rel(_predictPSO); rel(_densityLambdaPSO); rel(_gatherLambdasPSO);
-    rel(_applyDeltaPSO); rel(_finalizePSO); rel(_renderPSO);
+    rel(_predictPSO); rel(_densityLambdaSortedPSO); rel(_applyDeltaSortedPSO);
+    rel(_scatterPositionsPSO); rel(_finalizePSO);
+    rel(_fluidDepthPSO); rel(_fluidSmoothPSO); rel(_fluidCompositePSO);
+    rel(_fluidDepthDSS); rel(_passthroughDSS);
+    rel(_depthLinearTex); rel(_depthAttachmentTex); rel(_smoothedDepthTex);
     rel(_library); rel(_queue);
 }
 
@@ -122,7 +125,6 @@ void Engine::reset(uint32_t particleCount) {
 }
 
 void Engine::buildPipelines() {
-    NS::Error* err = nullptr;
     _library = _device->newDefaultLibrary();
     if (!_library) {
         std::fprintf(stderr, "mtlphys: newDefaultLibrary() returned null — is the .metallib bundled?\n");
@@ -138,39 +140,94 @@ void Engine::buildPipelines() {
     _scatterParticlesPSO = makeComputePSO(_device, _library, "scatterParticles");
     _gatherPositionsPSO  = makeComputePSO(_device, _library, "gatherPositions");
     _countNeighborsPSO   = makeComputePSO(_device, _library, "countNeighbors");
-    _predictPSO          = makeComputePSO(_device, _library, "predictPositions");
-    _densityLambdaPSO    = makeComputePSO(_device, _library, "densityLambda");
-    _gatherLambdasPSO    = makeComputePSO(_device, _library, "gatherLambdas");
-    _applyDeltaPSO       = makeComputePSO(_device, _library, "applyDelta");
-    _finalizePSO         = makeComputePSO(_device, _library, "finalizeStep");
+    _predictPSO              = makeComputePSO(_device, _library, "predictPositions");
+    _densityLambdaSortedPSO  = makeComputePSO(_device, _library, "densityLambdaSorted");
+    _applyDeltaSortedPSO     = makeComputePSO(_device, _library, "applyDeltaSorted");
+    _scatterPositionsPSO     = makeComputePSO(_device, _library, "scatterPositionsToOriginal");
+    _finalizePSO             = makeComputePSO(_device, _library, "finalizeStep");
 
-    auto vertName = NS::String::string("particleVertex",   NS::UTF8StringEncoding);
-    auto fragName = NS::String::string("particleFragment", NS::UTF8StringEncoding);
-    auto vertFn   = _library->newFunction(vertName);
-    auto fragFn   = _library->newFunction(fragName);
+    // ---- Build the three SSF render pipelines ------------------------------
 
-    auto desc = MTL::RenderPipelineDescriptor::alloc()->init();
-    desc->setVertexFunction(vertFn);
-    desc->setFragmentFunction(fragFn);
-    desc->colorAttachments()->object(0)->setPixelFormat(MTL::PixelFormatBGRA8Unorm_sRGB);
-    desc->colorAttachments()->object(0)->setBlendingEnabled(true);
-    desc->colorAttachments()->object(0)->setRgbBlendOperation(MTL::BlendOperationAdd);
-    desc->colorAttachments()->object(0)->setAlphaBlendOperation(MTL::BlendOperationAdd);
-    desc->colorAttachments()->object(0)->setSourceRGBBlendFactor(MTL::BlendFactorSourceAlpha);
-    desc->colorAttachments()->object(0)->setSourceAlphaBlendFactor(MTL::BlendFactorSourceAlpha);
-    desc->colorAttachments()->object(0)->setDestinationRGBBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
-    desc->colorAttachments()->object(0)->setDestinationAlphaBlendFactor(MTL::BlendFactorOneMinusSourceAlpha);
-    desc->setDepthAttachmentPixelFormat(MTL::PixelFormatDepth32Float);
+    auto buildRenderPSO = [&](const char* vertName, const char* fragName,
+                              MTL::PixelFormat colorFmt,
+                              MTL::PixelFormat depthFmt) -> MTL::RenderPipelineState* {
+        auto vName = NS::String::string(vertName, NS::UTF8StringEncoding);
+        auto fName = NS::String::string(fragName, NS::UTF8StringEncoding);
+        auto vFn   = _library->newFunction(vName);
+        auto fFn   = _library->newFunction(fName);
+        if (!vFn || !fFn) {
+            std::fprintf(stderr, "mtlphys: missing render shaders %s/%s\n", vertName, fragName);
+            std::abort();
+        }
+        auto desc = MTL::RenderPipelineDescriptor::alloc()->init();
+        desc->setVertexFunction(vFn);
+        desc->setFragmentFunction(fFn);
+        desc->colorAttachments()->object(0)->setPixelFormat(colorFmt);
+        if (depthFmt != MTL::PixelFormatInvalid) {
+            desc->setDepthAttachmentPixelFormat(depthFmt);
+        }
+        NS::Error* e = nullptr;
+        auto pso = _device->newRenderPipelineState(desc, &e);
+        desc->release(); vFn->release(); fFn->release();
+        if (!pso) {
+            std::fprintf(stderr, "mtlphys: failed to build PSO %s/%s: %s\n", vertName, fragName,
+                         e ? e->localizedDescription()->utf8String() : "unknown");
+            std::abort();
+        }
+        return pso;
+    };
 
-    _renderPSO = _device->newRenderPipelineState(desc, &err);
-    desc->release();
-    vertFn->release();
-    fragFn->release();
-    if (!_renderPSO) {
-        std::fprintf(stderr, "mtlphys: failed to build render PSO: %s\n",
-                     err ? err->localizedDescription()->utf8String() : "unknown");
-        std::abort();
+    _fluidDepthPSO     = buildRenderPSO("fluidDepthVertex",      "fluidDepthFragment",
+                                        MTL::PixelFormatR32Float, MTL::PixelFormatDepth32Float);
+    _fluidSmoothPSO    = buildRenderPSO("fullscreenVertex",      "fluidSmoothFragment",
+                                        MTL::PixelFormatR32Float, MTL::PixelFormatInvalid);
+    // Composite renders to the MTKView drawable, which has a Depth32Float
+    // attachment configured. The pipeline must declare it too even though the
+    // composite shader doesn't read/write depth.
+    _fluidCompositePSO = buildRenderPSO("fullscreenVertex",      "fluidCompositeFragment",
+                                        MTL::PixelFormatBGRA8Unorm_sRGB, MTL::PixelFormatDepth32Float);
+
+    // Depth-stencil states. Depth pass uses Less + write-enabled; the fullscreen
+    // passes don't read or write depth.
+    {
+        auto d = MTL::DepthStencilDescriptor::alloc()->init();
+        d->setDepthCompareFunction(MTL::CompareFunctionLess);
+        d->setDepthWriteEnabled(true);
+        _fluidDepthDSS = _device->newDepthStencilState(d);
+        d->release();
     }
+    {
+        auto d = MTL::DepthStencilDescriptor::alloc()->init();
+        d->setDepthCompareFunction(MTL::CompareFunctionAlways);
+        d->setDepthWriteEnabled(false);
+        _passthroughDSS = _device->newDepthStencilState(d);
+        d->release();
+    }
+}
+
+void Engine::ensureRenderTargets(uint32_t w, uint32_t h) {
+    if (w == _rtWidth && h == _rtHeight && _depthLinearTex) return;
+    auto rel = [](auto*& t) { if (t) { t->release(); t = nullptr; } };
+    rel(_depthLinearTex); rel(_depthAttachmentTex); rel(_smoothedDepthTex);
+
+    auto desc = MTL::TextureDescriptor::alloc()->init();
+    desc->setTextureType(MTL::TextureType2D);
+    desc->setWidth(w);
+    desc->setHeight(h);
+    desc->setStorageMode(MTL::StorageModePrivate);
+    desc->setUsage(MTL::TextureUsageRenderTarget | MTL::TextureUsageShaderRead);
+
+    desc->setPixelFormat(MTL::PixelFormatR32Float);
+    _depthLinearTex   = _device->newTexture(desc);
+    _smoothedDepthTex = _device->newTexture(desc);
+
+    desc->setPixelFormat(MTL::PixelFormatDepth32Float);
+    desc->setUsage(MTL::TextureUsageRenderTarget);
+    _depthAttachmentTex = _device->newTexture(desc);
+
+    desc->release();
+    _rtWidth  = w;
+    _rtHeight = h;
 }
 
 void Engine::buildBuffers(uint32_t particleCount) {
@@ -207,7 +264,7 @@ void Engine::buildSpatialBuffers() {
 
     auto rel = [](auto*& p) { if (p) { p->release(); p = nullptr; } };
     rel(_cellHashes); rel(_cellCounts); rel(_cellStart); rel(_cellCursor);
-    rel(_chunkSums); rel(_sortedIndex); rel(_sortedPositions);
+    rel(_chunkSums); rel(_sortedIndex); rel(_sortedPositions); rel(_sortedPositionsNext);
     rel(_neighborCounts); rel(_spatialParams);
     rel(_lambdas); rel(_sortedLambdas);
 
@@ -218,17 +275,18 @@ void Engine::buildSpatialBuffers() {
     const size_t cellBytes      = _totalCells * sizeof(uint32_t);
     const size_t chunkBytes     = _scanChunkCount * sizeof(uint32_t);
 
-    _cellHashes      = _device->newBuffer(particleBytes,         MTL::ResourceStorageModePrivate);
-    _cellCounts      = _device->newBuffer(cellBytesP1,           MTL::ResourceStorageModePrivate);
-    _cellStart       = _device->newBuffer(cellBytesP1,           MTL::ResourceStorageModePrivate);
-    _cellCursor      = _device->newBuffer(cellBytes,             MTL::ResourceStorageModePrivate);
-    _chunkSums       = _device->newBuffer(chunkBytes,            MTL::ResourceStorageModePrivate);
-    _sortedIndex     = _device->newBuffer(particleBytes,         MTL::ResourceStorageModePrivate);
-    _sortedPositions = _device->newBuffer(particleVec4Bs,        MTL::ResourceStorageModePrivate);
-    _neighborCounts  = _device->newBuffer(particleBytes,         MTL::ResourceStorageModePrivate);
-    _spatialParams   = _device->newBuffer(sizeof(SpatialParams), MTL::ResourceStorageModeShared);
-    _lambdas         = _device->newBuffer(particleFloatBs,       MTL::ResourceStorageModePrivate);
-    _sortedLambdas   = _device->newBuffer(particleFloatBs,       MTL::ResourceStorageModePrivate);
+    _cellHashes          = _device->newBuffer(particleBytes,         MTL::ResourceStorageModePrivate);
+    _cellCounts          = _device->newBuffer(cellBytesP1,           MTL::ResourceStorageModePrivate);
+    _cellStart           = _device->newBuffer(cellBytesP1,           MTL::ResourceStorageModePrivate);
+    _cellCursor          = _device->newBuffer(cellBytes,             MTL::ResourceStorageModePrivate);
+    _chunkSums           = _device->newBuffer(chunkBytes,            MTL::ResourceStorageModePrivate);
+    _sortedIndex         = _device->newBuffer(particleBytes,         MTL::ResourceStorageModePrivate);
+    _sortedPositions     = _device->newBuffer(particleVec4Bs,        MTL::ResourceStorageModePrivate);
+    _sortedPositionsNext = _device->newBuffer(particleVec4Bs,        MTL::ResourceStorageModePrivate);
+    _neighborCounts      = _device->newBuffer(particleBytes,         MTL::ResourceStorageModePrivate);
+    _spatialParams       = _device->newBuffer(sizeof(SpatialParams), MTL::ResourceStorageModeShared);
+    _lambdas             = _device->newBuffer(particleFloatBs,       MTL::ResourceStorageModePrivate);
+    _sortedLambdas       = _device->newBuffer(particleFloatBs,       MTL::ResourceStorageModePrivate);
 
     auto* sp = static_cast<SpatialParams*>(_spatialParams->contents());
     sp->gridOrigin         = mp::float3{ kBoundsMin.x, kBoundsMin.y, kBoundsMin.z };
@@ -424,54 +482,53 @@ void Engine::step(MTL::CommandBuffer* cmd, float dt) {
     // 2. Spatial hash on predicted positions (also produces sortedPositions)
     buildSpatialHash(cmd);
 
-    // 3. Solver iterations
+    // 3. Solver iterations — sorted-order, ping-pong sortedPositions buffers.
+    MTL::Buffer* current = _sortedPositions;
+    MTL::Buffer* next    = _sortedPositionsNext;
+
     for (uint32_t iter = 0; iter < kSolverIters; ++iter) {
         // 3a. density + lambda
         {   auto* enc = cmd->computeCommandEncoder();
-            enc->setComputePipelineState(_densityLambdaPSO);
-            enc->setBuffer(_positions,        0, 0);
+            enc->setComputePipelineState(_densityLambdaSortedPSO);
+            enc->setBuffer(current,           0, 8);
             enc->setBuffer(_cellStart,        0, 3);
             enc->setBuffer(_sortedIndex,      0, 5);
-            enc->setBuffer(_spatialParams,    0, 7);
-            enc->setBuffer(_sortedPositions,  0, 8);
-            enc->setBuffer(_lambdas,          0, 9);
-            enc->setBuffer(_pbfParams,        0, 10);
-            enc->dispatchThreads(MTL::Size(padded, 1, 1),
-                                 MTL::Size(kThreadgroupSize, 1, 1));
-            enc->endEncoding(); }
-
-        // 3b. gather lambdas → sortedLambdas
-        {   auto* enc = cmd->computeCommandEncoder();
-            enc->setComputePipelineState(_gatherLambdasPSO);
-            enc->setBuffer(_sortedIndex,    0, 5);
-            enc->setBuffer(_spatialParams,  0, 7);
-            enc->setBuffer(_lambdas,        0, 9);
-            enc->setBuffer(_sortedLambdas,  0, 11);
-            enc->dispatchThreads(MTL::Size(padded, 1, 1),
-                                 MTL::Size(kThreadgroupSize, 1, 1));
-            enc->endEncoding(); }
-
-        // 3c. apply position correction
-        {   auto* enc = cmd->computeCommandEncoder();
-            enc->setComputePipelineState(_applyDeltaPSO);
-            enc->setBuffer(_positions,        0, 0);
-            enc->setBuffer(_cellStart,        0, 3);
-            enc->setBuffer(_sortedIndex,      0, 5);
-            enc->setBuffer(_spatialParams,    0, 7);
-            enc->setBuffer(_sortedPositions,  0, 8);
-            enc->setBuffer(_lambdas,          0, 9);
-            enc->setBuffer(_pbfParams,        0, 10);
             enc->setBuffer(_sortedLambdas,    0, 11);
+            enc->setBuffer(_lambdas,          0, 9);
+            enc->setBuffer(_spatialParams,    0, 7);
+            enc->setBuffer(_pbfParams,        0, 10);
             enc->dispatchThreads(MTL::Size(padded, 1, 1),
                                  MTL::Size(kThreadgroupSize, 1, 1));
             enc->endEncoding(); }
 
-        // (We do NOT re-gatherPositions per iter — neighbor positions become
-        // slightly stale across iters but stability is fine for K=3. Add a
-        // re-gather if K grows or instability appears.)
+        // 3b. apply delta
+        {   auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(_applyDeltaSortedPSO);
+            enc->setBuffer(current,           0, 8);
+            enc->setBuffer(_cellStart,        0, 3);
+            enc->setBuffer(_sortedLambdas,    0, 11);
+            enc->setBuffer(next,              0, 12);
+            enc->setBuffer(_spatialParams,    0, 7);
+            enc->setBuffer(_pbfParams,        0, 10);
+            enc->dispatchThreads(MTL::Size(padded, 1, 1),
+                                 MTL::Size(kThreadgroupSize, 1, 1));
+            enc->endEncoding(); }
+
+        std::swap(current, next);
     }
 
-    // 4. Box clamp + velocity recompute + damping
+    // 4. Scatter sorted positions back to original-index layout
+    {   auto* enc = cmd->computeCommandEncoder();
+        enc->setComputePipelineState(_scatterPositionsPSO);
+        enc->setBuffer(current,        0, 8);
+        enc->setBuffer(_sortedIndex,   0, 5);
+        enc->setBuffer(_positions,     0, 0);
+        enc->setBuffer(_spatialParams, 0, 7);
+        enc->dispatchThreads(MTL::Size(padded, 1, 1),
+                             MTL::Size(kThreadgroupSize, 1, 1));
+        enc->endEncoding(); }
+
+    // 5. Box clamp + velocity recompute + walls
     {   auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(_finalizePSO);
         enc->setBuffer(_positions,      0, 0);
@@ -525,30 +582,84 @@ void Engine::runExclusiveScan(MTL::CommandBuffer* cmd,
 }
 
 void Engine::render(MTL::CommandBuffer* cmd,
-                    MTL::RenderPassDescriptor* passDesc,
+                    MTL::RenderPassDescriptor* finalPassDesc,
+                    uint32_t pixelWidth,
+                    uint32_t pixelHeight,
                     float aspectRatio,
                     float timeSeconds) {
-    const float r = 9.0f;
-    const float a = timeSeconds * 0.3f;
+    ensureRenderTargets(pixelWidth, pixelHeight);
+
+    // ---- Camera ----
+    const float fovY = 1.0f;
+    const float r    = 9.0f;
+    const float a    = timeSeconds * 0.3f;
     const simd::float3 eye{ r * std::cos(a), 3.0f, r * std::sin(a) };
     const simd::float3 center{ 0, 0, 0 };
-    const simd::float3 up{ 0, 1, 0 };
+    const simd::float3 upV{ 0, 1, 0 };
 
     RenderUniforms u{};
-    u.viewProj       = perspective(1.0f, aspectRatio, 0.1f, 100.0f) * lookAt(eye, center, up);
+    u.view           = lookAt(eye, center, upV);
+    u.proj           = perspective(fovY, aspectRatio, 0.1f, 100.0f);
     u.cameraPos      = mp::float3{ eye.x, eye.y, eye.z };
-    u.particleRadius = kParticleRadius;
+    u.particleRadius = kParticleRadius * 1.7f;   // bigger than physics radius → smoother surface
+    u.invScreen      = mp::float2{ 1.0f / float(pixelWidth), 1.0f / float(pixelHeight) };
+    u.tanHalfFovY    = std::tan(fovY * 0.5f);
+    u.aspect         = aspectRatio;
 
-    const uint32_t maxN = kMaxNeighborsForViz;
+    // ---- Pass 1: depth (offscreen) ----
+    {
+        auto desc = MTL::RenderPassDescriptor::alloc()->init();
+        auto color = desc->colorAttachments()->object(0);
+        color->setTexture(_depthLinearTex);
+        color->setLoadAction(MTL::LoadActionClear);
+        color->setStoreAction(MTL::StoreActionStore);
+        color->setClearColor(MTL::ClearColor(0, 0, 0, 1));   // 0 = "no fluid"
+        auto depth = desc->depthAttachment();
+        depth->setTexture(_depthAttachmentTex);
+        depth->setLoadAction(MTL::LoadActionClear);
+        depth->setStoreAction(MTL::StoreActionDontCare);
+        depth->setClearDepth(1.0);
 
-    auto* enc = cmd->renderCommandEncoder(passDesc);
-    enc->setRenderPipelineState(_renderPSO);
-    enc->setVertexBuffer(_positions, 0, 0);
-    enc->setVertexBytes(&u, sizeof(u), 1);
-    enc->setVertexBuffer(_neighborCounts, 0, 2);
-    enc->setVertexBytes(&maxN, sizeof(maxN), 3);
-    enc->drawPrimitives(MTL::PrimitiveTypeTriangle,
-                        NS::UInteger(0), NS::UInteger(6),
-                        NS::UInteger(_particleCount));
-    enc->endEncoding();
+        auto* enc = cmd->renderCommandEncoder(desc);
+        desc->release();
+        enc->setRenderPipelineState(_fluidDepthPSO);
+        enc->setDepthStencilState(_fluidDepthDSS);
+        enc->setVertexBuffer(_positions, 0, 0);
+        enc->setVertexBytes(&u, sizeof(u), 1);
+        enc->setFragmentBytes(&u, sizeof(u), 1);
+        enc->drawPrimitives(MTL::PrimitiveTypeTriangle,
+                            NS::UInteger(0), NS::UInteger(6),
+                            NS::UInteger(_particleCount));
+        enc->endEncoding();
+    }
+
+    // ---- Pass 2: smooth depth (offscreen → smoothed offscreen) ----
+    {
+        auto desc = MTL::RenderPassDescriptor::alloc()->init();
+        auto color = desc->colorAttachments()->object(0);
+        color->setTexture(_smoothedDepthTex);
+        color->setLoadAction(MTL::LoadActionClear);
+        color->setStoreAction(MTL::StoreActionStore);
+        color->setClearColor(MTL::ClearColor(0, 0, 0, 1));
+
+        auto* enc = cmd->renderCommandEncoder(desc);
+        desc->release();
+        enc->setRenderPipelineState(_fluidSmoothPSO);
+        enc->setDepthStencilState(_passthroughDSS);
+        enc->setFragmentTexture(_depthLinearTex, 0);
+        enc->setFragmentBytes(&u, sizeof(u), 1);
+        enc->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0), NS::UInteger(3));
+        enc->endEncoding();
+    }
+
+    // ---- Pass 3: composite to the MTKView drawable ----
+    {
+        auto* enc = cmd->renderCommandEncoder(finalPassDesc);
+        enc->setRenderPipelineState(_fluidCompositePSO);
+        enc->setDepthStencilState(_passthroughDSS);
+        enc->setFragmentTexture(_smoothedDepthTex, 0);
+        enc->setFragmentBytes(&u, sizeof(u), 1);
+        enc->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0), NS::UInteger(3));
+        enc->endEncoding();
+    }
 }

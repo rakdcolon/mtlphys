@@ -87,7 +87,11 @@ final class Renderer: NSObject, MTKViewDelegate {
 
         // ---- Render CB ----
         guard let renderCmd = commandQueue.makeCommandBuffer() else { return }
-        engine.render(with: renderCmd, renderPassDescriptor: passDesc, aspectRatio: aspect, time: t)
+        let w = UInt32(view.drawableSize.width)
+        let h = UInt32(view.drawableSize.height)
+        engine.render(with: renderCmd, renderPassDescriptor: passDesc,
+                      pixelWidth: w, pixelHeight: h,
+                      aspectRatio: aspect, time: t)
         renderCmd.present(drawable)
         renderCmd.addCompletedHandler { [weak self] cb in
             guard let self else { return }

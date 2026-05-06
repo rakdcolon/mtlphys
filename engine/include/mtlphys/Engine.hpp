@@ -15,7 +15,9 @@ namespace MTL {
     class Library;
     class ComputePipelineState;
     class RenderPipelineState;
+    class DepthStencilState;
     class Buffer;
+    class Texture;
     class CommandBuffer;
     class RenderPassDescriptor;
 }
@@ -44,9 +46,13 @@ public:
     // This is the headline simulation entry point.
     void step(MTL::CommandBuffer* cmd, float dt);
 
-    // Render the particle field, colored by neighbor density.
+    // Render the particle field as a fluid surface (screen-space fluid: depth
+    // pass → masked Gaussian blur → composite with normal reconstruction).
+    // Caller passes the MTKView final pass descriptor + drawable size.
     void render(MTL::CommandBuffer* cmd,
-                MTL::RenderPassDescriptor* passDesc,
+                MTL::RenderPassDescriptor* finalPassDesc,
+                uint32_t pixelWidth,
+                uint32_t pixelHeight,
                 float aspectRatio,
                 float timeSeconds);
 
@@ -80,6 +86,7 @@ private:
     void buildSpatialBuffers();
     void seedParticles(uint32_t particleCount);
     void writePBFParams(float dt);
+    void ensureRenderTargets(uint32_t w, uint32_t h);
 
     MTL::Device*               _device              = nullptr;
     MTL::CommandQueue*         _queue               = nullptr;
@@ -95,12 +102,25 @@ private:
     MTL::ComputePipelineState* _scatterParticlesPSO = nullptr;
     MTL::ComputePipelineState* _gatherPositionsPSO  = nullptr;
     MTL::ComputePipelineState* _countNeighborsPSO   = nullptr;
-    MTL::ComputePipelineState* _predictPSO          = nullptr;
-    MTL::ComputePipelineState* _densityLambdaPSO    = nullptr;
-    MTL::ComputePipelineState* _gatherLambdasPSO    = nullptr;
-    MTL::ComputePipelineState* _applyDeltaPSO       = nullptr;
-    MTL::ComputePipelineState* _finalizePSO         = nullptr;
-    MTL::RenderPipelineState*  _renderPSO           = nullptr;
+    MTL::ComputePipelineState* _predictPSO              = nullptr;
+    MTL::ComputePipelineState* _densityLambdaSortedPSO  = nullptr;
+    MTL::ComputePipelineState* _applyDeltaSortedPSO     = nullptr;
+    MTL::ComputePipelineState* _scatterPositionsPSO     = nullptr;
+    MTL::ComputePipelineState* _finalizePSO             = nullptr;
+
+    // Render pipelines for screen-space fluid rendering
+    MTL::RenderPipelineState*  _fluidDepthPSO       = nullptr;
+    MTL::RenderPipelineState*  _fluidSmoothPSO      = nullptr;
+    MTL::RenderPipelineState*  _fluidCompositePSO   = nullptr;
+    MTL::DepthStencilState*    _fluidDepthDSS       = nullptr;
+    MTL::DepthStencilState*    _passthroughDSS      = nullptr;
+
+    // Offscreen textures for SSF passes (allocated lazily on resize)
+    MTL::Texture* _depthLinearTex     = nullptr;  // R32Float, view-space depth
+    MTL::Texture* _depthAttachmentTex = nullptr;  // Depth32Float, sphere occlusion
+    MTL::Texture* _smoothedDepthTex   = nullptr;  // R32Float, smoothed depth
+    uint32_t      _rtWidth  = 0;
+    uint32_t      _rtHeight = 0;
 
     // Particle state
     MTL::Buffer* _positions      = nullptr;
@@ -115,13 +135,14 @@ private:
     MTL::Buffer* _cellStart      = nullptr;
     MTL::Buffer* _cellCursor     = nullptr;
     MTL::Buffer* _chunkSums      = nullptr;
-    MTL::Buffer* _sortedIndex    = nullptr;
-    MTL::Buffer* _sortedPositions= nullptr;
-    MTL::Buffer* _neighborCounts = nullptr;
-    MTL::Buffer* _spatialParams  = nullptr;
+    MTL::Buffer* _sortedIndex         = nullptr;
+    MTL::Buffer* _sortedPositions     = nullptr;
+    MTL::Buffer* _sortedPositionsNext = nullptr;   // ping-pong target for solver
+    MTL::Buffer* _neighborCounts      = nullptr;
+    MTL::Buffer* _spatialParams       = nullptr;
 
     // PBF solver scratch
-    MTL::Buffer* _lambdas        = nullptr;   // float per particle
+    MTL::Buffer* _lambdas        = nullptr;   // float per particle (orig-index, for read-back)
     MTL::Buffer* _sortedLambdas  = nullptr;   // float per sorted slot
 
     uint32_t _particleCount   = 0;

@@ -6,6 +6,7 @@
   #include <metal_stdlib>
   using namespace metal;
   namespace mp {
+      using float2   = ::float2;
       using float3   = ::float3;
       using float4   = ::float4;
       using float4x4 = ::float4x4;
@@ -14,6 +15,7 @@
 #else
   #include <simd/simd.h>
   namespace mp {
+      using float2   = simd::float2;
       using float3   = simd::float3;
       using float4   = simd::float4;
       using float4x4 = simd::float4x4;
@@ -68,10 +70,17 @@ struct alignas(16) PBFParams {
     uint32_t   _pad2;
 };
 
+// Render uniforms for screen-space fluid rendering.
+// view + proj are kept separate (vs combined viewProj) because the depth pass
+// computes view-space sphere positions for accurate per-pixel depth.
 struct alignas(16) RenderUniforms {
-    mp::float4x4 viewProj;
+    mp::float4x4 view;
+    mp::float4x4 proj;
     mp::float3   cameraPos;
     float        particleRadius;
+    mp::float2   invScreen;        // 1/width, 1/height
+    float        tanHalfFovY;      // for view-space ray reconstruction in composite
+    float        aspect;
 };
 
 } // namespace mtlphys
