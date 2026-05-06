@@ -73,6 +73,13 @@ struct alignas(16) PBFParams {
 // Render uniforms for screen-space fluid rendering.
 // view + proj are kept separate (vs combined viewProj) because the depth pass
 // computes view-space sphere positions for accurate per-pixel depth.
+// Rigid sphere — used by the sphere-drop scene for a kinematic obstacle the
+// fluid is pushed away from each solver iteration.
+struct alignas(16) SphereParams {
+    mp::float3 center;
+    float      radius;
+};
+
 struct alignas(16) RenderUniforms {
     mp::float4x4 view;
     mp::float4x4 proj;

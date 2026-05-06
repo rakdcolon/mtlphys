@@ -7,6 +7,9 @@ import simd
 protocol CameraInputDelegate: AnyObject {
     func dragOrbit(deltaX: CGFloat, deltaY: CGFloat)
     func scrollZoom(delta: CGFloat)
+    func pulseStart(at viewPoint: CGPoint, viewSize: CGSize)
+    func pulseDrag(to viewPoint: CGPoint, deltaX: CGFloat, deltaY: CGFloat, viewSize: CGSize)
+    func pulseEnd()
 }
 
 final class FluidMTKView: MTKView {
@@ -16,7 +19,6 @@ final class FluidMTKView: MTKView {
     override func becomeFirstResponder() -> Bool { true }
 
     override func mouseDown(with event: NSEvent) {
-        // Make sure we receive subsequent drag events.
         window?.makeFirstResponder(self)
     }
     override func mouseDragged(with event: NSEvent) {
@@ -25,14 +27,33 @@ final class FluidMTKView: MTKView {
     override func scrollWheel(with event: NSEvent) {
         inputDelegate?.scrollZoom(delta: event.scrollingDeltaY)
     }
+    // Right mouse → fluid pulse
+    override func rightMouseDown(with event: NSEvent) {
+        let local = convert(event.locationInWindow, from: nil)
+        inputDelegate?.pulseStart(at: local, viewSize: bounds.size)
+    }
+    override func rightMouseDragged(with event: NSEvent) {
+        let local = convert(event.locationInWindow, from: nil)
+        inputDelegate?.pulseDrag(to: local,
+                                 deltaX: event.deltaX, deltaY: event.deltaY,
+                                 viewSize: bounds.size)
+    }
+    override func rightMouseUp(with event: NSEvent) {
+        inputDelegate?.pulseEnd()
+    }
 }
 
 // MARK: - SwiftUI wrapper
 
 struct MetalView: NSViewRepresentable {
     @ObservedObject var hud: PerfHUD
+    @ObservedObject var sceneCtrl: SceneController
 
-    func makeCoordinator() -> Renderer { Renderer(hud: hud) }
+    func makeCoordinator() -> Renderer {
+        let r = Renderer(hud: hud)
+        sceneCtrl.onSelect = { [weak r] kind in r?.changeScene(kind) }
+        return r
+    }
 
     func makeNSView(context: Context) -> FluidMTKView {
         let view = FluidMTKView()
@@ -93,6 +114,12 @@ final class Renderer: NSObject, MTKViewDelegate, CameraInputDelegate {
 
     func attach(view: MTKView) { self.view = view }
 
+    // MARK: scene changes
+
+    func changeScene(_ kind: SceneKind) {
+        engine.reset(withParticleCount: engine.particleCount, scene: kind.rawValue)
+    }
+
     // MARK: input
 
     func dragOrbit(deltaX: CGFloat, deltaY: CGFloat) {
@@ -107,6 +134,58 @@ final class Renderer: NSObject, MTKViewDelegate, CameraInputDelegate {
         let sens: Float = 0.04
         distance *= (1.0 - Float(delta) * sens)
         distance  = max(4.0, min(40.0, distance))
+    }
+
+    // MARK: pulse — right-click drag to push fluid
+
+    private var pulseHeld     = false
+    private var pulsePoint    = CGPoint.zero
+    private var pulseViewSize = CGSize.zero
+    private var pulseDX: Float = 0
+    private var pulseDY: Float = 0
+
+    func pulseStart(at viewPoint: CGPoint, viewSize: CGSize) {
+        pulseHeld = true
+        pulsePoint = viewPoint
+        pulseViewSize = viewSize
+        pulseDX = 0; pulseDY = 0
+    }
+    func pulseDrag(to viewPoint: CGPoint, deltaX: CGFloat, deltaY: CGFloat, viewSize: CGSize) {
+        pulsePoint = viewPoint
+        pulseViewSize = viewSize
+        pulseDX += Float(deltaX)
+        pulseDY += Float(deltaY)
+    }
+    func pulseEnd() { pulseHeld = false }
+
+    // Compute the current pulse: cursor RAY (origin + dir) and the world-space
+    // force the user just dragged. Cylinder pulse on the GPU side picks up any
+    // particle within radius of this ray, anywhere along it — so we don't need
+    // a hit-point. Returns nil if the user isn't actively dragging.
+    private func computePulse() -> (origin: SIMD3<Float>, dir: SIMD3<Float>, force: SIMD3<Float>)? {
+        guard pulseHeld, (pulseDX != 0 || pulseDY != 0),
+              pulseViewSize.width > 0, pulseViewSize.height > 0 else { return nil }
+
+        let ndcX = Float(pulsePoint.x / pulseViewSize.width  * 2.0 - 1.0)
+        let ndcY = Float(pulsePoint.y / pulseViewSize.height * 2.0 - 1.0)
+
+        let eye    = eyePosition()
+        let fwd    = simd_normalize(target - eye)
+        let right  = simd_normalize(simd_cross(fwd, SIMD3<Float>(0, 1, 0)))
+        let upV    = simd_cross(right, fwd)
+
+        let fovY: Float = 1.0
+        let tanHalfFov  = tan(fovY * 0.5)
+        let aspect      = Float(pulseViewSize.width / pulseViewSize.height)
+        let dir = simd_normalize(fwd
+                               + right * (ndcX * tanHalfFov * aspect)
+                               + upV   * (ndcY * tanHalfFov))
+
+        let scale: Float = 0.6
+        let force = (right * pulseDX - upV * pulseDY) * scale
+
+        pulseDX = 0; pulseDY = 0
+        return (eye, dir, force)
     }
 
     private func eyePosition() -> SIMD3<Float> {
@@ -134,6 +213,13 @@ final class Renderer: NSObject, MTKViewDelegate, CameraInputDelegate {
 
         // ---- Sim ----
         guard let simCmd = commandQueue.makeCommandBuffer() else { return }
+        if let pulse = computePulse() {
+            engine.applyMousePulse(with: simCmd,
+                                   originX: pulse.origin.x, originY: pulse.origin.y, originZ: pulse.origin.z,
+                                   dirX:    pulse.dir.x,    dirY:    pulse.dir.y,    dirZ:    pulse.dir.z,
+                                   forceX:  pulse.force.x,  forceY:  pulse.force.y,  forceZ:  pulse.force.z,
+                                   radius: 0.5)
+        }
         engine.step(with: simCmd, dt: stepDt)
         simCmd.addCompletedHandler { [weak self] cb in
             guard let self else { return }

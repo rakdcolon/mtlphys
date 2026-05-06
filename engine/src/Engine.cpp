@@ -8,6 +8,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <random>
 #include <simd/simd.h>
 
@@ -22,7 +23,7 @@ constexpr uint32_t kScanChunkSize   = mtlphys::Engine::kScanChunkSize;
 constexpr simd::float3 kBoundsMin{ -3.0f, -3.0f, -3.0f };
 constexpr simd::float3 kBoundsMax{  3.0f,  6.0f,  3.0f };
 constexpr float        kCellSize       = 0.10f;     // = h
-constexpr float        kParticleRadius = 0.035f;
+constexpr float        kParticleRadius = 0.022f;   // smaller dots = smoother surface (paired with a wider smoothing kernel below)
 constexpr uint32_t     kMaxNeighborsForViz = 96;
 
 constexpr float        kSmoothingH    = 0.10f;      // SPH smoothing length
@@ -112,15 +113,21 @@ Engine::~Engine() {
     rel(_scatterParticlesPSO); rel(_gatherPositionsPSO); rel(_countNeighborsPSO);
     rel(_predictPSO); rel(_densityLambdaSortedPSO); rel(_applyDeltaSortedPSO);
     rel(_scatterPositionsPSO); rel(_finalizePSO); rel(_computeFoamPSO);
+    rel(_sphereCollisionPSO); rel(_mousePulsePSO);
     rel(_fluidDepthPSO); rel(_fluidThicknessPSO); rel(_fluidSmoothPSO); rel(_fluidCompositePSO);
-    rel(_wireBoxPSO); rel(_foamPSO);
-    rel(_foamIntensity);
-    rel(_fluidDepthDSS); rel(_compositeDSS); rel(_wireBoxDSS); rel(_passthroughDSS);
+    rel(_wireBoxPSO); rel(_foamPSO); rel(_sphereDrawPSO);
+    rel(_foamIntensity); rel(_sphereParams);
+    rel(_fluidDepthDSS); rel(_compositeDSS); rel(_wireBoxDSS); rel(_passthroughDSS); rel(_sphereDrawDSS);
     rel(_depthLinearTex); rel(_depthAttachmentTex); rel(_smoothedDepthTex); rel(_thicknessTex);
     rel(_library); rel(_queue);
 }
 
 void Engine::reset(uint32_t particleCount) {
+    reset(particleCount, _currentScene);
+}
+
+void Engine::reset(uint32_t particleCount, uint32_t sceneIdx) {
+    _currentScene = sceneIdx;
     buildBuffers(particleCount);
     buildSpatialBuffers();
     seedParticles(particleCount);
@@ -148,6 +155,8 @@ void Engine::buildPipelines() {
     _scatterPositionsPSO     = makeComputePSO(_device, _library, "scatterPositionsToOriginal");
     _finalizePSO             = makeComputePSO(_device, _library, "finalizeStep");
     _computeFoamPSO          = makeComputePSO(_device, _library, "computeFoam");
+    _sphereCollisionPSO      = makeComputePSO(_device, _library, "sphereCollision");
+    _mousePulsePSO           = makeComputePSO(_device, _library, "applyMousePulse");
 
     // ---- Build the three SSF render pipelines ------------------------------
 
@@ -251,6 +260,28 @@ void Engine::buildPipelines() {
         }
     }
 
+    // Sphere render pipeline (sphere-drop scene). Drawable color + depth,
+    // no blending — opaque sphere with proper depth occlusion.
+    {
+        auto vName = NS::String::string("sphereDrawVertex",   NS::UTF8StringEncoding);
+        auto fName = NS::String::string("sphereDrawFragment", NS::UTF8StringEncoding);
+        auto vFn   = _library->newFunction(vName);
+        auto fFn   = _library->newFunction(fName);
+        auto desc  = MTL::RenderPipelineDescriptor::alloc()->init();
+        desc->setVertexFunction(vFn);
+        desc->setFragmentFunction(fFn);
+        desc->colorAttachments()->object(0)->setPixelFormat(MTL::PixelFormatBGRA8Unorm_sRGB);
+        desc->setDepthAttachmentPixelFormat(MTL::PixelFormatDepth32Float);
+        NS::Error* e = nullptr;
+        _sphereDrawPSO = _device->newRenderPipelineState(desc, &e);
+        desc->release(); vFn->release(); fFn->release();
+        if (!_sphereDrawPSO) {
+            std::fprintf(stderr, "mtlphys: failed to build sphereDraw PSO: %s\n",
+                         e ? e->localizedDescription()->utf8String() : "unknown");
+            std::abort();
+        }
+    }
+
     // Foam pipeline. Same target as composite (drawable + Depth32Float).
     // Additive blending so multiple overlapping bright sprites accumulate.
     {
@@ -310,6 +341,13 @@ void Engine::buildPipelines() {
         _passthroughDSS = _device->newDepthStencilState(d);
         d->release();
     }
+    {   // Sphere: standard opaque geometry — Less, write depth.
+        auto d = MTL::DepthStencilDescriptor::alloc()->init();
+        d->setDepthCompareFunction(MTL::CompareFunctionLess);
+        d->setDepthWriteEnabled(true);
+        _sphereDrawDSS = _device->newDepthStencilState(d);
+        d->release();
+    }
 }
 
 void Engine::ensureRenderTargets(uint32_t w, uint32_t h) {
@@ -347,12 +385,14 @@ void Engine::buildBuffers(uint32_t particleCount) {
 
     auto rel = [](auto*& p) { if (p) { p->release(); p = nullptr; } };
     rel(_positions); rel(_velocities); rel(_prevPositions); rel(_params); rel(_pbfParams);
+    rel(_sphereParams);
 
     _positions     = _device->newBuffer(vecBytes,             MTL::ResourceStorageModeShared);
     _velocities    = _device->newBuffer(vecBytes,             MTL::ResourceStorageModeShared);
     _prevPositions = _device->newBuffer(vecBytes,             MTL::ResourceStorageModePrivate);
     _params        = _device->newBuffer(sizeof(SimParams),    MTL::ResourceStorageModeShared);
     _pbfParams     = _device->newBuffer(sizeof(PBFParams),    MTL::ResourceStorageModeShared);
+    _sphereParams  = _device->newBuffer(sizeof(SphereParams), MTL::ResourceStorageModeShared);
 }
 
 void Engine::buildSpatialBuffers() {
@@ -414,15 +454,83 @@ void Engine::buildSpatialBuffers() {
 void Engine::seedParticles(uint32_t particleCount) {
     auto* pos = static_cast<simd::float4*>(_positions->contents());
     auto* vel = static_cast<simd::float4*>(_velocities->contents());
+    const float spacing = kSmoothingH * 0.5f;   // same packing kRestDensity is tuned for
 
-    // PBF requires roughly uniform initial density that matches kRestDensity.
-    // Random sampling produces clusters whose density spikes the constraint
-    // and blows up the solver. We lay particles in a regular cubic block at
-    // half-h spacing — the same packing the rest-density was tuned for.
-    const float    spacing  = kSmoothingH * 0.5f;
-    const uint32_t side     = uint32_t(std::ceil(std::cbrt(double(particleCount))));
-    const float    halfBlk  = 0.5f * (side - 1) * spacing;
-    const float    topY     = 2.0f;   // shorter fall = lower impact velocity
+    // Zero everything first so leftover data from a larger previous scene
+    // doesn't poison the state if we end up filling fewer slots.
+    std::memset(vel, 0, roundUp(particleCount, kThreadgroupSize) * sizeof(simd::float4));
+
+    if (_currentScene == kSceneDamBreak) {
+        // Dam break: fluid as a tall column along the LEFT wall, released
+        // from rest. Footprint auto-sizes by particle count so it fits the
+        // box: cap height at 5.5 m, then pick a square base big enough to
+        // hold the rest at h/2 packing.
+        constexpr float kMaxHeightM = 5.5f;
+        const uint32_t  nLayers     = uint32_t(kMaxHeightM / spacing);   // 110
+        const uint32_t  perLayer    = (particleCount + nLayers - 1) / nLayers;
+        const uint32_t  side        = uint32_t(std::ceil(std::sqrt(double(perLayer))));
+        const float     baseExtent  = (side - 1) * spacing;
+        const float     xMin        = kBoundsMin.x + 0.05f;        // hugs the left wall
+        const float     yMin        = kBoundsMin.y + 0.05f;        // sits on the floor
+        const float     zStart      = -baseExtent * 0.5f;          // centered in z
+
+        uint32_t i = 0;
+        for (uint32_t y = 0; y < nLayers && i < particleCount; ++y) {
+            for (uint32_t z = 0; z < side && i < particleCount; ++z) {
+                for (uint32_t x = 0; x < side && i < particleCount; ++x) {
+                    pos[i] = simd::float4{
+                        xMin   + x * spacing,
+                        yMin   + y * spacing,
+                        zStart + z * spacing,
+                        1.0f
+                    };
+                    ++i;
+                }
+            }
+        }
+        return;
+    }
+
+    if (_currentScene == kSceneSphereDrop) {
+        // Pre-settled lake covering the box floor; sphere is reset to a high
+        // start position. Lake fills bottom-up at h/2 spacing.
+        const float xMin = kBoundsMin.x + 0.05f;
+        const float xMax = kBoundsMax.x - 0.05f;
+        const float zMin = kBoundsMin.z + 0.05f;
+        const float zMax = kBoundsMax.z - 0.05f;
+        const float yMin = kBoundsMin.y + 0.05f;
+        const uint32_t nx = uint32_t((xMax - xMin) / spacing);
+        const uint32_t nz = uint32_t((zMax - zMin) / spacing);
+
+        uint32_t i = 0;
+        for (uint32_t y = 0; ; ++y) {
+            const float yPos = yMin + y * spacing;
+            if (yPos > kBoundsMax.y - 0.5f || i >= particleCount) break;
+            for (uint32_t z = 0; z < nz && i < particleCount; ++z) {
+                for (uint32_t x = 0; x < nx && i < particleCount; ++x) {
+                    pos[i] = simd::float4{
+                        xMin + x * spacing,
+                        yPos,
+                        zMin + z * spacing,
+                        1.0f
+                    };
+                    ++i;
+                }
+            }
+        }
+
+        // Reset the sphere — high starting position so it falls visibly.
+        _sphereCenterX = 0.0f;
+        _sphereCenterY = 4.5f;
+        _sphereCenterZ = 0.0f;
+        _sphereVelX = _sphereVelY = _sphereVelZ = 0.0f;
+        return;
+    }
+
+    // Default: cube drop — a cubic block falls from rest at y=2.
+    const uint32_t side    = uint32_t(std::ceil(std::cbrt(double(particleCount))));
+    const float    halfBlk = 0.5f * (side - 1) * spacing;
+    const float    topY    = 2.0f;
 
     uint32_t i = 0;
     for (uint32_t y = 0; y < side && i < particleCount; ++y) {
@@ -434,7 +542,6 @@ void Engine::seedParticles(uint32_t particleCount) {
                     -halfBlk + z * spacing,
                     1.0f
                 };
-                vel[i] = simd::float4{ 0, 0, 0, 0 };
                 ++i;
             }
         }
@@ -580,6 +687,30 @@ void Engine::step(MTL::CommandBuffer* cmd, float dt) {
     writePBFParams(dt);
     const uint32_t padded = roundUp(_particleCount, kThreadgroupSize);
 
+    // Sphere kinematics for sphere-drop scene. Integrated CPU-side and
+    // uploaded into _sphereParams so the GPU collision kernel sees fresh
+    // state. Generic light air drag (0.99/frame) plus floor restitution.
+    if (_currentScene == kSceneSphereDrop) {
+        _sphereVelY += -9.81f * dt;
+        _sphereVelX *= 0.998f;
+        _sphereVelY *= 0.998f;
+        _sphereVelZ *= 0.998f;
+        _sphereCenterX += _sphereVelX * dt;
+        _sphereCenterY += _sphereVelY * dt;
+        _sphereCenterZ += _sphereVelZ * dt;
+        const float r = _sphereRadius;
+        if (_sphereCenterX - r < kBoundsMin.x) { _sphereCenterX = kBoundsMin.x + r; _sphereVelX = -_sphereVelX * 0.4f; }
+        if (_sphereCenterX + r > kBoundsMax.x) { _sphereCenterX = kBoundsMax.x - r; _sphereVelX = -_sphereVelX * 0.4f; }
+        if (_sphereCenterY - r < kBoundsMin.y) { _sphereCenterY = kBoundsMin.y + r; _sphereVelY = -_sphereVelY * 0.4f; }
+        if (_sphereCenterY + r > kBoundsMax.y) { _sphereCenterY = kBoundsMax.y - r; _sphereVelY = -_sphereVelY * 0.4f; }
+        if (_sphereCenterZ - r < kBoundsMin.z) { _sphereCenterZ = kBoundsMin.z + r; _sphereVelZ = -_sphereVelZ * 0.4f; }
+        if (_sphereCenterZ + r > kBoundsMax.z) { _sphereCenterZ = kBoundsMax.z - r; _sphereVelZ = -_sphereVelZ * 0.4f; }
+
+        auto* sp = static_cast<SphereParams*>(_sphereParams->contents());
+        sp->center = mp::float3{ _sphereCenterX, _sphereCenterY, _sphereCenterZ };
+        sp->radius = _sphereRadius;
+    }
+
     // 1. Predict
     {   auto* enc = cmd->computeCommandEncoder();
         enc->setComputePipelineState(_predictPSO);
@@ -626,6 +757,19 @@ void Engine::step(MTL::CommandBuffer* cmd, float dt) {
                                  MTL::Size(kThreadgroupSize, 1, 1));
             enc->endEncoding(); }
 
+        // 3c. sphere collision (sphere-drop scene only) — push particles
+        //      out of the sphere's volume in place on `next`.
+        if (_currentScene == kSceneSphereDrop) {
+            auto* enc = cmd->computeCommandEncoder();
+            enc->setComputePipelineState(_sphereCollisionPSO);
+            enc->setBuffer(next,            0, 8);
+            enc->setBuffer(_spatialParams,  0, 7);
+            enc->setBuffer(_sphereParams,   0, 13);
+            enc->dispatchThreads(MTL::Size(padded, 1, 1),
+                                 MTL::Size(kThreadgroupSize, 1, 1));
+            enc->endEncoding();
+        }
+
         std::swap(current, next);
     }
 
@@ -664,6 +808,36 @@ void Engine::step(MTL::CommandBuffer* cmd, float dt) {
         enc->dispatchThreads(MTL::Size(padded, 1, 1),
                              MTL::Size(kThreadgroupSize, 1, 1));
         enc->endEncoding(); }
+}
+
+void Engine::applyMousePulse(MTL::CommandBuffer* cmd,
+                             const float rayOrigin[3],
+                             const float rayDir[3],
+                             const float force[3],
+                             float radius) {
+    struct PulseUniforms {
+        simd::float3 rayOrigin;
+        float        radius;
+        simd::float3 rayDir;
+        float        _pad0;
+        simd::float3 force;
+        float        _pad1;
+    } pulse{};
+    pulse.rayOrigin = simd::float3{ rayOrigin[0], rayOrigin[1], rayOrigin[2] };
+    pulse.rayDir    = simd::float3{ rayDir[0],    rayDir[1],    rayDir[2] };
+    pulse.radius    = radius;
+    pulse.force     = simd::float3{ force[0],     force[1],     force[2] };
+
+    const uint32_t padded = roundUp(_particleCount, kThreadgroupSize);
+    auto* enc = cmd->computeCommandEncoder();
+    enc->setComputePipelineState(_mousePulsePSO);
+    enc->setBuffer(_velocities, 0, 0);
+    enc->setBuffer(_positions,  0, 1);
+    enc->setBytes(&pulse, sizeof(pulse), 2);
+    enc->setBytes(&_particleCount, sizeof(_particleCount), 3);
+    enc->dispatchThreads(MTL::Size(padded, 1, 1),
+                         MTL::Size(kThreadgroupSize, 1, 1));
+    enc->endEncoding();
 }
 
 void Engine::runExclusiveScan(MTL::CommandBuffer* cmd,
@@ -725,7 +899,7 @@ void Engine::render(MTL::CommandBuffer* cmd,
     u.view           = lookAt(eye, center, upV);
     u.proj           = perspective(fovY, aspectRatio, 0.1f, 100.0f);
     u.cameraPos      = mp::float3{ eye.x, eye.y, eye.z };
-    u.particleRadius = kParticleRadius * 1.7f;   // bigger than physics radius → smoother surface
+    u.particleRadius = kParticleRadius * 1.3f;   // bigger than physics radius for surface continuity in dense regions, tight enough that isolated droplets read as discrete drops not pale halos
     u.invScreen      = mp::float2{ 1.0f / float(pixelWidth), 1.0f / float(pixelHeight) };
     u.tanHalfFovY    = std::tan(fovY * 0.5f);
     u.aspect         = aspectRatio;
@@ -819,6 +993,19 @@ void Engine::render(MTL::CommandBuffer* cmd,
         enc->setVertexBytes(&bMin, sizeof(bMin), 2);
         enc->setVertexBytes(&bMax, sizeof(bMax), 3);
         enc->drawPrimitives(MTL::PrimitiveTypeLine, NS::UInteger(0), NS::UInteger(24));
+
+        // 3b'. Sphere (sphere-drop scene only) — opaque, depth-tested against
+        //      composite's fluid depth, writes its own depth so foam after
+        //      occludes correctly.
+        if (_currentScene == kSceneSphereDrop) {
+            enc->setRenderPipelineState(_sphereDrawPSO);
+            enc->setDepthStencilState(_sphereDrawDSS);
+            enc->setVertexBytes(&u, sizeof(u), 1);
+            enc->setVertexBuffer(_sphereParams, 0, 13);
+            enc->setFragmentBytes(&u, sizeof(u), 1);
+            enc->setFragmentBuffer(_sphereParams, 0, 13);
+            enc->drawPrimitives(MTL::PrimitiveTypeTriangle, NS::UInteger(0), NS::UInteger(6));
+        }
 
         // 3c. Foam — additive bright sprites, depth-tested against fluid surface.
         enc->setRenderPipelineState(_foamPSO);

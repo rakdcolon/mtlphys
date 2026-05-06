@@ -19,7 +19,14 @@ NS_ASSUME_NONNULL_BEGIN
                        aspectRatio:(float)aspect
                                 eyeX:(float)eyeX eyeY:(float)eyeY eyeZ:(float)eyeZ
                           targetX:(float)targetX targetY:(float)targetY targetZ:(float)targetZ;
+- (void)applyMousePulseWithCommandBuffer:(id<MTLCommandBuffer>)cmd
+                              originX:(float)ox originY:(float)oy originZ:(float)oz
+                                 dirX:(float)dx dirY:(float)dy dirZ:(float)dz
+                               forceX:(float)fx forceY:(float)fy forceZ:(float)fz
+                               radius:(float)radius;
 - (void)resetWithParticleCount:(uint32_t)count;
+- (void)resetWithParticleCount:(uint32_t)count scene:(uint32_t)sceneIdx;
+@property (readonly) uint32_t currentScene;
 
 @property (readonly) uint32_t particleCount;
 

@@ -125,8 +125,8 @@ vertex FSOut fullscreenVertex(uint vid [[ vertex_id ]]) {
 // Pass 2: depth smoothing (masked Gaussian)
 // ---------------------------------------------------------------------------
 
-constant float kSmoothSigma = 2.0;
-constant int   kSmoothRadius = 3;
+constant float kSmoothSigma  = 2.8;
+constant int   kSmoothRadius = 4;
 
 fragment float4 fluidSmoothFragment(FSOut                    in        [[ stage_in ]],
                                     texture2d<float>         depthTex  [[ texture(0) ]],
@@ -365,9 +365,9 @@ vertex FoamOut foamVertex(constant float4*         positions     [[ buffer(0) ]]
     const float3 viewCenter  = (u.view * float4(worldCenter, 1)).xyz;
     const float2 corner      = kCorners[vid];
 
-    // Slightly smaller than the SSF particle radius so foam reads as a
-    // bright fleck on top of the surface, not as the surface itself.
-    const float  radius      = u.particleRadius * 0.55;
+    // Very tight sprite — smaller than the visible SSF particle so foam reads
+    // as a bright dot rather than a halo extending around the particle.
+    const float  radius      = u.particleRadius * 0.25;
     const float3 viewPos     = viewCenter + float3(corner.x * radius,
                                                    corner.y * radius, 0);
     FoamOut o;
@@ -382,6 +382,77 @@ fragment float4 foamFragment(FoamOut in [[ stage_in ]])
     if (in.intensity < 0.05) discard_fragment();
     const float r2 = dot(in.uv, in.uv);
     if (r2 > 1.0) discard_fragment();
-    const float falloff = exp(-r2 * 2.5) * in.intensity;
-    return float4(falloff, falloff, falloff, falloff);  // additive white
+    // Sharp Gaussian (exp(-7r²)) so the foam stays inside the sprite quad
+    // and doesn't bleed outward as a halo around isolated particles.
+    const float falloff = exp(-r2 * 7.0) * in.intensity * 0.65;
+    return float4(falloff, falloff, falloff, falloff);
+}
+
+// ---------------------------------------------------------------------------
+// Rigid sphere render — one camera-facing billboard, sphere depth + Phong
+// shading in the fragment. Drawn after the fluid composite so the fluid
+// surface depth-tests properly against it (sphere visible above water,
+// occluded below).
+// ---------------------------------------------------------------------------
+
+struct SphereVOut {
+    float4 position    [[ position ]];
+    float2 uv;
+    float3 viewCenter;
+};
+
+vertex SphereVOut sphereDrawVertex(constant RenderUniforms& u      [[ buffer(1) ]],
+                                   constant SphereParams&   sphere [[ buffer(13) ]],
+                                   uint                     vid    [[ vertex_id ]])
+{
+    const float2 corner = kCorners[vid];
+    const float3 viewCenter = (u.view * float4(sphere.center, 1.0)).xyz;
+    const float3 viewPos = viewCenter + float3(corner.x * sphere.radius,
+                                               corner.y * sphere.radius, 0);
+    SphereVOut o;
+    o.position   = u.proj * float4(viewPos, 1.0);
+    o.uv         = corner;
+    o.viewCenter = viewCenter;
+    return o;
+}
+
+struct SphereFOut {
+    float4 color [[ color(0) ]];
+    float  depth [[ depth(less) ]];
+};
+
+fragment SphereFOut sphereDrawFragment(SphereVOut               in     [[ stage_in ]],
+                                       constant RenderUniforms& u      [[ buffer(1) ]],
+                                       constant SphereParams&   sphere [[ buffer(13) ]])
+{
+    const float r2 = dot(in.uv, in.uv);
+    if (r2 > 1.0) discard_fragment();
+
+    // Sphere-surface offset toward camera; reconstruct view-space surface position.
+    const float  zOff    = sqrt(1.0 - r2);
+    const float3 viewPos = in.viewCenter + float3(in.uv.x * sphere.radius,
+                                                  in.uv.y * sphere.radius,
+                                                  sphere.radius * zOff);
+    const float3 N       = normalize(viewPos - in.viewCenter);
+
+    // Light: same world-space sun direction as the sky, transformed to view.
+    const float3 sunV  = normalize((u.view * float4(sunDirWorld(), 0)).xyz);
+    const float3 V     = float3(0, 0, 1);
+    const float3 H     = normalize(sunV + V);
+
+    const float diff   = max(dot(N, sunV), 0.0);
+    const float spec   = pow(max(dot(N, H), 0.0), 80.0);
+    const float fres   = pow(1.0 - max(dot(N, V), 0.0), 3.0);
+
+    constexpr float3 base = float3(0.85, 0.32, 0.22);   // warm red sphere
+    const     float3 col  = base * (0.25 + 0.75 * diff)
+                          + float3(1, 1, 1) * spec * 0.7
+                          + float3(1, 0.95, 0.88) * fres * 0.18;
+
+    const float4 clip = u.proj * float4(viewPos, 1.0);
+
+    SphereFOut o;
+    o.color = float4(col, 1.0);
+    o.depth = clip.z / clip.w;
+    return o;
 }

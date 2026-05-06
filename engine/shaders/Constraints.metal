@@ -213,6 +213,70 @@ kernel void scatterPositionsToOriginal(device const float4*    sortedPositions [
 }
 
 // ---------------------------------------------------------------------------
+// Mouse pulse: Gaussian-falloff velocity impulse along the cursor RAY.
+// ---------------------------------------------------------------------------
+// We pulse a cylinder along the camera ray rather than a sphere at one point.
+// This way clicking anywhere on screen affects the fluid the ray actually
+// passes through, regardless of where the box wall happens to be.
+
+struct MousePulseUniforms {
+    float3 rayOrigin;     // world-space ray origin (camera eye)
+    float  radius;        // cylinder radius (Gaussian falloff)
+    float3 rayDir;        // normalized world-space ray direction
+    float  _pad0;
+    float3 force;         // world-space velocity added at the ray
+    float  _pad1;
+};
+
+kernel void applyMousePulse(device float4*               velocities [[ buffer(0) ]],
+                            device const float4*         positions  [[ buffer(1) ]],
+                            constant MousePulseUniforms& u          [[ buffer(2) ]],
+                            constant uint&               count      [[ buffer(3) ]],
+                            uint                         gid        [[ thread_position_in_grid ]])
+{
+    if (gid >= count) return;
+    const float3 p  = positions[gid].xyz;
+
+    // Distance from particle to nearest point on the ray (cylinder distance).
+    const float3 toP = p - u.rayOrigin;
+    const float  t   = dot(toP, u.rayDir);
+    if (t <= 0.0) return;                          // behind the camera
+
+    const float3 closest = u.rayOrigin + u.rayDir * t;
+    const float3 d  = p - closest;
+    const float  r2 = dot(d, d);
+    const float  R2 = u.radius * u.radius;
+    if (r2 < R2) {
+        const float intensity = exp(-r2 / (R2 * 0.4));
+        velocities[gid] = float4(velocities[gid].xyz + u.force * intensity, 0.0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sphere collision (sphere-drop scene): push particles outside the sphere
+// ---------------------------------------------------------------------------
+// Kinematic constraint applied IN PLACE on the current sorted-positions
+// buffer once per solver iteration. One-way coupling — particles get
+// pushed, the sphere is unaffected by particles.
+
+kernel void sphereCollision(device float4*           positionsBuf [[ buffer(8) ]],
+                            constant SpatialParams&  sp           [[ buffer(7) ]],
+                            constant SphereParams&   sphere       [[ buffer(13) ]],
+                            uint                     slot         [[ thread_position_in_grid ]])
+{
+    if (slot >= sp.particleCount) return;
+    const float3 p   = positionsBuf[slot].xyz;
+    const float3 d   = p - sphere.center;
+    const float  r2  = dot(d, d);
+    const float  rr  = sphere.radius * sphere.radius;
+    if (r2 < rr) {
+        const float r = sqrt(max(r2, 1e-8f));
+        const float3 dir = d / r;
+        positionsBuf[slot] = float4(sphere.center + dir * sphere.radius, 1.0f);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Foam intensity per particle (post-finalize, uses final velocities)
 // ---------------------------------------------------------------------------
 // Foam appears where the fluid is BOTH moving fast AND near the surface.

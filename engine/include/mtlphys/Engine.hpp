@@ -32,7 +32,16 @@ public:
     Engine(const Engine&) = delete;
     Engine& operator=(const Engine&) = delete;
 
-    void reset(uint32_t particleCount);
+    // Scene IDs — kept as a plain uint32_t so the Obj-C bridge can pass them
+    // without dragging the C++ enum across.
+    static constexpr uint32_t kSceneCubeDrop   = 0;
+    static constexpr uint32_t kSceneDamBreak   = 1;
+    static constexpr uint32_t kSceneSphereDrop = 2;
+
+    void reset(uint32_t particleCount);                          // keeps current scene
+    void reset(uint32_t particleCount, uint32_t sceneIdx);
+
+    uint32_t currentScene() const noexcept { return _currentScene; }
 
     // Old semi-implicit Euler integrator with axis-aligned box bounds. Kept
     // for backward compatibility (tests use it as a known-good reference).
@@ -45,6 +54,15 @@ public:
     // Full PBF step: predict → spatial hash → 3 solver iterations → finalize.
     // This is the headline simulation entry point.
     void step(MTL::CommandBuffer* cmd, float dt);
+
+    // Apply a Gaussian-falloff velocity impulse to particles within `radius`
+    // of the cursor RAY. rayOrigin / rayDir / force are world-space; rayDir
+    // must be normalized.
+    void applyMousePulse(MTL::CommandBuffer* cmd,
+                         const float rayOrigin[3],
+                         const float rayDir[3],
+                         const float force[3],
+                         float radius);
 
     // Render the particle field as a fluid surface (screen-space fluid: depth
     // pass → smooth → thickness → composite + box). Caller supplies camera
@@ -109,6 +127,8 @@ private:
     MTL::ComputePipelineState* _scatterPositionsPSO     = nullptr;
     MTL::ComputePipelineState* _finalizePSO             = nullptr;
     MTL::ComputePipelineState* _computeFoamPSO          = nullptr;
+    MTL::ComputePipelineState* _sphereCollisionPSO      = nullptr;
+    MTL::ComputePipelineState* _mousePulsePSO            = nullptr;
 
     // Render pipelines for screen-space fluid rendering
     MTL::RenderPipelineState*  _fluidDepthPSO       = nullptr;
@@ -117,6 +137,8 @@ private:
     MTL::RenderPipelineState*  _fluidCompositePSO   = nullptr;
     MTL::RenderPipelineState*  _wireBoxPSO          = nullptr;
     MTL::RenderPipelineState*  _foamPSO             = nullptr;
+    MTL::RenderPipelineState*  _sphereDrawPSO       = nullptr;
+    MTL::DepthStencilState*    _sphereDrawDSS       = nullptr;
     MTL::DepthStencilState*    _fluidDepthDSS       = nullptr;
     MTL::DepthStencilState*    _compositeDSS        = nullptr;  // depthWrite=true, always
     MTL::DepthStencilState*    _wireBoxDSS          = nullptr;  // depthWrite=false, less
@@ -153,10 +175,18 @@ private:
     MTL::Buffer* _lambdas        = nullptr;   // float per particle (orig-index, for read-back)
     MTL::Buffer* _sortedLambdas  = nullptr;   // float per sorted slot
     MTL::Buffer* _foamIntensity  = nullptr;   // float per particle, [0,1]
+    MTL::Buffer* _sphereParams   = nullptr;   // SphereParams uniform (only used by sphere-drop scene)
+
+    // CPU-side sphere state (sphere-drop scene only). Integrated each frame
+    // and uploaded into _sphereParams.
+    float _sphereCenterX = 0.0f, _sphereCenterY = 4.5f, _sphereCenterZ = 0.0f;
+    float _sphereVelX    = 0.0f, _sphereVelY    = 0.0f, _sphereVelZ    = 0.0f;
+    float _sphereRadius  = 0.6f;
 
     uint32_t _particleCount   = 0;
     uint32_t _totalCells      = 0;
     uint32_t _scanChunkCount  = 0;
+    uint32_t _currentScene    = 0;   // kSceneCubeDrop
 };
 
 } // namespace mtlphys

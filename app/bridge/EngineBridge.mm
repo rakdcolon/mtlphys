@@ -43,8 +43,28 @@
     _engine->render(mtlCmd, mtlPass, pixelWidth, pixelHeight, aspect, eye, target);
 }
 
+- (void)applyMousePulseWithCommandBuffer:(id<MTLCommandBuffer>)cmd
+                              originX:(float)ox originY:(float)oy originZ:(float)oz
+                                 dirX:(float)dx dirY:(float)dy dirZ:(float)dz
+                               forceX:(float)fx forceY:(float)fy forceZ:(float)fz
+                               radius:(float)radius {
+    auto* mtlCmd = (__bridge MTL::CommandBuffer*)cmd;
+    const float o[3] = { ox, oy, oz };
+    const float d[3] = { dx, dy, dz };
+    const float f[3] = { fx, fy, fz };
+    _engine->applyMousePulse(mtlCmd, o, d, f, radius);
+}
+
 - (void)resetWithParticleCount:(uint32_t)count {
     _engine->reset(count);
+}
+
+- (void)resetWithParticleCount:(uint32_t)count scene:(uint32_t)sceneIdx {
+    _engine->reset(count, sceneIdx);
+}
+
+- (uint32_t)currentScene {
+    return _engine->currentScene();
 }
 
 - (uint32_t)particleCount {
