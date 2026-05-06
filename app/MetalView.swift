@@ -10,6 +10,7 @@ protocol CameraInputDelegate: AnyObject {
     func pulseStart(at viewPoint: CGPoint, viewSize: CGSize)
     func pulseDrag(to viewPoint: CGPoint, deltaX: CGFloat, deltaY: CGFloat, viewSize: CGSize)
     func pulseEnd()
+    func keyPressed(_ chars: String)
 }
 
 final class FluidMTKView: MTKView {
@@ -41,17 +42,25 @@ final class FluidMTKView: MTKView {
     override func rightMouseUp(with event: NSEvent) {
         inputDelegate?.pulseEnd()
     }
+
+    override func keyDown(with event: NSEvent) {
+        if let chars = event.charactersIgnoringModifiers?.lowercased() {
+            inputDelegate?.keyPressed(chars)
+        } else {
+            super.keyDown(with: event)
+        }
+    }
 }
 
 // MARK: - SwiftUI wrapper
 
 struct MetalView: NSViewRepresentable {
     @ObservedObject var hud: PerfHUD
-    @ObservedObject var sceneCtrl: SceneController
+    @ObservedObject var sim: SimController
 
     func makeCoordinator() -> Renderer {
-        let r = Renderer(hud: hud)
-        sceneCtrl.onSelect = { [weak r] kind in r?.changeScene(kind) }
+        let r = Renderer(hud: hud, sim: sim)
+        sim.onConfigChange = { [weak r] in r?.applyConfig() }
         return r
     }
 
@@ -96,8 +105,9 @@ final class Renderer: NSObject, MTKViewDelegate, CameraInputDelegate {
     private var timingCount: Int = 0
 
     private let hud: PerfHUD
+    private unowned let sim: SimController
 
-    init(hud: PerfHUD) {
+    init(hud: PerfHUD, sim: SimController) {
         guard let dev = MTLCreateSystemDefaultDevice() else {
             fatalError("mtlphys: no Metal device available")
         }
@@ -108,16 +118,23 @@ final class Renderer: NSObject, MTKViewDelegate, CameraInputDelegate {
         self.commandQueue = q
         self.engine = MPEngineBridge(device: dev)
         self.hud = hud
+        self.sim = sim
         super.init()
-        Task { @MainActor in self.hud.particleCount = Int(self.engine.particleCount) }
+        // Initial reset to match the SimController's defaults so engine state
+        // and UI agree from frame 0.
+        Task { @MainActor in
+            self.applyConfig()
+            self.hud.particleCount = Int(self.engine.particleCount)
+        }
     }
 
     func attach(view: MTKView) { self.view = view }
 
-    // MARK: scene changes
+    // MARK: scene / count changes (fired by SimController.onConfigChange)
 
-    func changeScene(_ kind: SceneKind) {
-        engine.reset(withParticleCount: engine.particleCount, scene: kind.rawValue)
+    @MainActor
+    func applyConfig() {
+        engine.reset(withParticleCount: sim.particleCount, scene: sim.scene.rawValue)
     }
 
     // MARK: input
@@ -157,6 +174,16 @@ final class Renderer: NSObject, MTKViewDelegate, CameraInputDelegate {
         pulseDY += Float(deltaY)
     }
     func pulseEnd() { pulseHeld = false }
+
+    func keyPressed(_ chars: String) {
+        Task { @MainActor in
+            switch chars {
+            case " ":          self.sim.togglePause()
+            case "r":          self.sim.requestReset()
+            default:           break
+            }
+        }
+    }
 
     // Compute the current pulse: cursor RAY (origin + dir) and the world-space
     // force the user just dragged. Cylinder pulse on the GPU side picks up any
@@ -209,18 +236,24 @@ final class Renderer: NSObject, MTKViewDelegate, CameraInputDelegate {
         lastFrameTime = now
 
         let aspect = Float(view.drawableSize.width / max(view.drawableSize.height, 1))
-        let stepDt = min(dt, 1.0/120.0)
+
+        // Pause/speed read from SimController each frame.
+        let paused = sim.paused
+        let speed  = sim.speed
+        let stepDt = paused ? 0.0 : min(dt, 1.0/120.0) * speed
 
         // ---- Sim ----
         guard let simCmd = commandQueue.makeCommandBuffer() else { return }
-        if let pulse = computePulse() {
+        if !paused, let pulse = computePulse() {
             engine.applyMousePulse(with: simCmd,
                                    originX: pulse.origin.x, originY: pulse.origin.y, originZ: pulse.origin.z,
                                    dirX:    pulse.dir.x,    dirY:    pulse.dir.y,    dirZ:    pulse.dir.z,
                                    forceX:  pulse.force.x,  forceY:  pulse.force.y,  forceZ:  pulse.force.z,
                                    radius: 0.5)
         }
-        engine.step(with: simCmd, dt: stepDt)
+        if !paused {
+            engine.step(with: simCmd, dt: stepDt)
+        }
         simCmd.addCompletedHandler { [weak self] cb in
             guard let self else { return }
             let elapsed = cb.gpuEndTime - cb.gpuStartTime
