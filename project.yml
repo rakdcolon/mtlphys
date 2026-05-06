@@ -56,3 +56,24 @@ targets:
         ENABLE_HARDENED_RUNTIME: YES
         CODE_SIGN_STYLE: Automatic
         CODE_SIGN_IDENTITY: "-"
+
+  mtlphys_tests:
+    type: tool
+    platform: macOS
+    sources:
+      - path: tests
+      - path: engine/shaders
+    dependencies:
+      - target: MtlPhysCore
+      - sdk: Metal.framework
+      - sdk: Foundation.framework
+    settings:
+      base:
+        HEADER_SEARCH_PATHS:
+          - $(SRCROOT)/vendor/metal-cpp
+          - $(SRCROOT)/vendor/doctest
+          - $(SRCROOT)/engine/include
+          - $(SRCROOT)/engine/shaders
+          - $(SRCROOT)/tests
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_IDENTITY: "-"

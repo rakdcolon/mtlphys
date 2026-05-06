@@ -24,6 +24,11 @@
     _engine->step(mtlCmd, dt);
 }
 
+- (void)buildSpatialHashWithCommandBuffer:(id<MTLCommandBuffer>)cmd {
+    auto* mtlCmd = (__bridge MTL::CommandBuffer*)cmd;
+    _engine->buildSpatialHash(mtlCmd);
+}
+
 - (void)renderWithCommandBuffer:(id<MTLCommandBuffer>)cmd
             renderPassDescriptor:(MTLRenderPassDescriptor*)passDesc
                      aspectRatio:(float)aspect

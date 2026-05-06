@@ -11,6 +11,7 @@ NS_ASSUME_NONNULL_BEGIN
 
 - (instancetype)initWithDevice:(id<MTLDevice>)device;
 - (void)stepWithCommandBuffer:(id<MTLCommandBuffer>)cmd dt:(float)dt;
+- (void)buildSpatialHashWithCommandBuffer:(id<MTLCommandBuffer>)cmd;
 - (void)renderWithCommandBuffer:(id<MTLCommandBuffer>)cmd
               renderPassDescriptor:(MTLRenderPassDescriptor*)passDesc
                        aspectRatio:(float)aspect
