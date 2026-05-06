@@ -1,0 +1,25 @@
+# macOS
+.DS_Store
+
+# Xcode
+*.xcodeproj/
+!project.yml
+*.xcworkspace/
+xcuserdata/
+*.xcuserstate
+DerivedData/
+build/
+.build/
+
+# Vendored deps
+vendor/metal-cpp/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Logs / scratch
+*.log
+.claude/
